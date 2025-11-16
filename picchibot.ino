@@ -1,9 +1,9 @@
 // =======================================================
-//  PICCHIBOT - PART 3: WIFI & RTOS
+//  PICCHIBOT - PART 4: MANUAL WI-FI RESET
 // =======================================================
-// This code adds a parallel FreeRTOS task to handle
-// Wi-Fi connectivity and a web setup portal
-// without freezing the main pet animations.
+// Adds a boot-up check. If the "OK" button is held
+// during boot, it erases saved Wi-Fi credentials
+// and forces the bot into AP Setup Mode.
 // =======================================================
 
 // --- Core Arduino & Sensor Libraries ---
@@ -46,8 +46,6 @@ Preferences preferences;
 TaskHandle_t hNetworkTask; // Handle for our network task
 
 // --- Global State Variables ---
-// These are marked 'volatile' because they are shared
-// between the two parallel tasks (Core 0 and Core 1).
 volatile bool isConnected = false;
 volatile String ipAddress = "No IP";
 
@@ -130,9 +128,7 @@ const unsigned char pet_anim[] PROGMEM = {
 // =======================================================
 //  HTML & CSS FOR THE SETUP WEB PAGE
 // =======================================================
-// This is the HTML code for the setup page. It's stored in
-// program memory to save RAM.
-// =======================================================
+// (This is identical to Part 3)
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html><head>
 <title>PicchiBot Setup</title>
@@ -175,13 +171,10 @@ const char index_html[] PROGMEM = R"rawliteral(
 // =======================================================
 //  CORE 0 - NETWORK TASK
 // =======================================================
-// This function runs in parallel on Core 0.
-// It handles Wi-Fi connection and the setup web server.
-// =======================================================
+// (This is identical to Part 3. No changes needed.)
 void taskNetwork(void *pvParameters) {
   Serial.println("Network Task started on Core 0");
 
-  // Load saved credentials
   preferences.begin("picchi-creds", false);
   String ssid = preferences.getString("ssid", "");
   String pass = preferences.getString("pass", "");
@@ -192,7 +185,7 @@ void taskNetwork(void *pvParameters) {
   if (ssid.length() > 0) {
     Serial.print("Trying to connect to saved WiFi: ");
     Serial.println(ssid);
-    ipAddress = "Connecting..."; // Show on OLED
+    ipAddress = "Connecting..."; 
 
     WiFi.begin(ssid.c_str(), pass.c_str());
     
@@ -209,50 +202,33 @@ void taskNetwork(void *pvParameters) {
       ipAddress = WiFi.localIP().toString();
       Serial.print("IP Address: ");
       Serial.println(ipAddress);
-      
-      // --- SUCCESS! ---
-      // This is where we will start the *main* web server
-      // for weather, notifications, etc.
-      // For now, the task just idles.
-      
     } else {
       Serial.println("\nFailed to connect to saved WiFi.");
       isConnected = false;
-      connectedAttempt = true; // Flag that we tried and failed
+      connectedAttempt = true;
     }
   }
 
-  // --- SETUP PORTAL MODE ---
-  // If we have no saved SSID, or if we tried and failed...
-  // ...start the Access Point (AP).
   if (!isConnected) {
     Serial.println("Starting Setup Portal (AP Mode)...");
     ipAddress = "Setup Mode";
     
-    // Start the "PicchiBot" AP
     WiFi.softAP("PicchiBot", "amishudhutomar");
     IPAddress apIP = WiFi.softAPIP();
     Serial.print("AP IP address: ");
     Serial.println(apIP);
 
-    // Start the Captive Portal
-    // This makes the setup page pop up on phones
     dnsServer.start(53, "*", apIP);
 
-    // --- Define Web Server Routes ---
-    
-    // This is the main setup page
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
       request->send_P(200, "text/html", index_html);
     });
 
-    // This is called when the form is submitted
     server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request) {
       Serial.println("Got /save request");
       String new_ssid;
       String new_pass;
 
-      // Get the form data
       if (request->hasParam("ssid", true)) {
         new_ssid = request->getParam("ssid", true)->value();
       }
@@ -263,13 +239,11 @@ void taskNetwork(void *pvParameters) {
       Serial.print("Saving new creds: ");
       Serial.println(new_ssid);
 
-      // Save to Preferences
       preferences.begin("picchi-creds", false);
       preferences.putString("ssid", new_ssid);
       preferences.putString("pass", new_pass);
       preferences.end();
 
-      // Send a success page and restart the bot
       String response = "<html><body><h2>Credentials Saved!</h2><p>PicchiBot will now restart and connect to <b>" + new_ssid + "</b>.</p><p>Please reconnect your phone to your home Wi-Fi.</p></body></html>";
       request->send(200, "text/html", response);
 
@@ -277,26 +251,21 @@ void taskNetwork(void *pvParameters) {
       ESP.restart();
     });
     
-    // For Captive Portal
     server.onNotFound([](AsyncWebServerRequest *request) {
       request->send_P(200, "text/html", index_html);
     });
 
-    server.begin(); // Start the server
+    server.begin();
     Serial.println("Web server started.");
     
-    // This loop is required for the captive portal
     while(true) {
       dnsServer.processNextRequest();
       vTaskDelay(10 / portTICK_PERIOD_MS);
     }
   }
   
-  // If we got here, we are connected to home Wi-Fi.
-  // The task will now just spin, but in the future
-  // it will handle weather updates.
   for(;;) {
-    vTaskDelay(10000 / portTICK_PERIOD_MS); // Check every 10s
+    vTaskDelay(10000 / portTICK_PERIOD_MS);
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println("Lost Wi-Fi connection. Rebooting...");
       ESP.restart();
@@ -306,24 +275,22 @@ void taskNetwork(void *pvParameters) {
 
 
 // =======================================================
-//  SETUP()
+//  SETUP() - *** THIS SECTION IS MODIFIED ***
 // =======================================================
 // This runs ONCE on Core 1.
-// Its only job is to start the hardware and launch tasks.
+// It now checks for the OK button *before* booting.
 // =======================================================
 void setup() {
   Serial.begin(115200);
 
-  // --- Initialize Hardware ---
+  // --- Initialize Hardware (PARTIAL) ---
+  // We MUST set up the OK button, Buzzer, and Screen pins FIRST
+  // to check for the manual reset.
   pinMode(PIN_SW_OK, INPUT_PULLUP);
-  pinMode(PIN_UP, INPUT_PULLUP);
-  pinMode(PIN_DOWN, INPUT_PULLUP);
-  pinMode(PIN_PET_LEFT, INPUT_PULLUP);
-  pinMode(PIN_PET_RIGHT, INPUT_PULLUP);
-
+  
   ledcSetup(BUZZER_CHANNEL, 5000, 8);
   ledcAttachPin(PIN_BUZZER, BUZZER_CHANNEL);
-
+  
   Wire.begin(PIN_SDA, PIN_SCL);
   Wire.setClock(400000); // Fast I2C
 
@@ -331,6 +298,41 @@ void setup() {
     Serial.println(F("SSD1306 allocation failed"));
     for (;;);
   }
+
+  // --- *** NEW: CHECK FOR MANUAL WIFI RESET *** ---
+  // If user is holding the OK button (LOW) during boot...
+  if (digitalRead(PIN_SW_OK) == LOW) {
+    // Show on screen
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(10, 15);
+    display.println(F("Wi-Fi Reset Detected!"));
+    display.setCursor(10, 30);
+    display.println(F("Erasing saved Wi-Fi."));
+    display.setCursor(10, 45);
+    display.println(F("Starting AP Mode..."));
+    display.display();
+    
+    // Play a distinct sound
+    beep(800, 100);
+    beep(600, 100);
+    beep(400, 100);
+
+    // Erase the credentials from flash memory
+    preferences.begin("picchi-creds", false);
+    preferences.clear(); // This erases everything
+    preferences.end();
+    
+    Serial.println("Manual Reset: Erased Wi-Fi credentials.");
+    delay(2500); // Hold the message on screen
+  }
+
+  // --- NOW, INITIALIZE THE REST OF THE HARDWARE ---
+  pinMode(PIN_UP, INPUT_PULLUP);
+  pinMode(PIN_DOWN, INPUT_PULLUP);
+  pinMode(PIN_PET_LEFT, INPUT_PULLUP);
+  pinMode(PIN_PET_RIGHT, INPUT_PULLUP);
 
   if (!mpu.begin()) {
     Serial.println(F("MPU6050 not found"));
@@ -345,7 +347,7 @@ void setup() {
   delay(500);
 
   // --- START THE NETWORK TASK ---
-  // This is the magic line. It creates our parallel task.
+  // (This part is identical to Part 3)
   xTaskCreatePinnedToCore(
       taskNetwork,      // 1. Function to run
       "Network Task",   // 2. Name
@@ -363,12 +365,11 @@ void setup() {
   lastBlinkTime = millis();
 }
 
+
 // =======================================================
 //  LOOP() - CORE 1 - UI TASK
 // =======================================================
-// This loop runs continuously on Core 1.
-// It is ONLY responsible for the fast, responsive UI.
-// =======================================================
+// (This is identical to Part 3)
 void loop() {
   switch (currentScreen) {
     case 0:
@@ -383,14 +384,13 @@ void loop() {
       handleSubMenu();
       break;
   }
-  // Add a tiny delay to be nice to the FreeRTOS scheduler
   vTaskDelay(10 / portTICK_PERIOD_MS); 
 }
 
 // =======================================================
 //  UI SCREEN HANDLERS
 // =======================================================
-// (These are identical to Part 2)
+// (This is identical to Part 3)
 
 void handlePetScreen() {
   if (digitalRead(PIN_SW_OK) == LOW && (millis() - lastButtonPress) > debounceDelay) {
@@ -424,7 +424,7 @@ void handlePetScreen() {
     eyeY += (targetY - eyeY) * 0.1;
 
     display.clearDisplay();
-    drawGazeEyes(); // This function is now modified
+    drawGazeEyes();
     display.display();
   }
 }
@@ -477,8 +477,6 @@ void handleSubMenu() {
   display.setTextSize(1);
   display.setCursor(0, 30);
   
-  // *** NEW ***
-  // Give WiFi status on the Weather page
   if (title == "WEATHER") {
     if (isConnected) {
       display.println("Connected!");
@@ -500,7 +498,7 @@ void handleSubMenu() {
 // =======================================================
 //  DRAWING, ANIMATION, & SOUND FUNCTIONS
 // =======================================================
-// (Identical to Part 2, except for drawGazeEyes)
+// (This is identical to Part 3)
 
 void playBootAnimation() {
   display.clearDisplay();
@@ -532,17 +530,14 @@ void playPetAnimation() {
 }
 
 void drawGazeEyes() {
-  // *** NEW: Draw Wi-Fi Status on Pet Screen ***
   display.setTextSize(1);
   display.setCursor(0, 0);
   if (isConnected) {
-    display.print(ipAddress); // Show IP
+    display.print(ipAddress);
   } else {
-    display.print("AP: PicchiBot"); // Show AP Mode
+    display.print("AP: PicchiBot");
   }
-  // ********************************************
 
-  // Handle Blinking
   if (millis() - lastBlinkTime > 3000) {
     isBlinking = true;
     lastBlinkTime = millis();
@@ -551,7 +546,6 @@ void drawGazeEyes() {
     isBlinking = false;
   }
 
-  // --- Draw Left Eye ---
   int leftEyeX = 42;
   int leftEyeY = 32;
   if (isBlinking) {
@@ -563,7 +557,6 @@ void drawGazeEyes() {
     display.fillCircle(pupilX, pupilY, 6, WHITE);
   }
 
-  // --- Draw Right Eye ---
   int rightEyeX = 86;
   int rightEyeY = 32;
   if (isBlinking) {
@@ -581,7 +574,7 @@ void drawMenu() {
   display.setTextColor(WHITE);
   display.setTextSize(1);
 
-  for (int i = 0; i < menuItemCount; i++) {
+  for (int i = 0; i < menuItemCount; i) {
     int yPos = 10 + (i * 13);
     if (i == currentItemIndex) {
       display.fillRoundRect(5, yPos - 3, 118, 12, 3, WHITE);
