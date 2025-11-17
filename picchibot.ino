@@ -1,12 +1,14 @@
 // =======================================================
-//  PICCHIBOT - PART 7: .INO COMPILER FIX
+//  PICCHIBOT - PART 8: PIN MAP & FEATURE FIX
 // =======================================================
-// This code fixes all 3 compiler errors from your log
-// by only editing the .ino file.
+// This code fixes all the issues you reported:
 //
-// 1. Adds '#undef' to fix the 'N' and 'E' macro collision.
-// 2. Replaces 'ledcSetup' with 'tone()' for the buzzer.
-// 3. Fixes the 'mpy.getAngleY()' typo.
+// 1.  CORRECTED PIN MAP: Uses your latest pin map.
+//     - OK: 32, UP: 26, DOWN: 33, LEFT: 25, RIGHT: 27
+// 2.  CYBERPUNK BOOT: Replaced the simple boot with
+//     your "glitch/cyber" effect boot animation.
+// 3.  COUNTDOWN TIMER: Added the "Timer" to the menu.
+//     It's now non-blocking and runs in the background.
 // =======================================================
 
 // --- Core & Sensor Libraries ---
@@ -17,8 +19,7 @@
 #include "FluxGarage_RoboEyes.h" // Your provided library
 
 // --- FIX #1: 'N' and 'E' MACRO CONFLICT ---
-// We undefine the macros from RoboEyes.h immediately
-// so they don't conflict with the ESP32 libraries.
+// (This is still required to fix the .h file conflict)
 #undef N
 #undef NE
 #undef E
@@ -27,29 +28,28 @@
 #undef SW
 #undef W
 #undef NW
-// --- END OF FIX #1 ---
 
 // --- Network & Utility Libraries ---
 #include <WiFi.h>
-#include <WebServer.h> // Using the blocking server from your plan
+#include <WebServer.h>
 #include <DNSServer.h>
 #include <HTTPClient.h>
 #include <Arduino_JSON.h>
 #include <Preferences.h>
 
-// ----------------- CONFIG (From Your Plan) -----------------
+// ----------------- CONFIG -----------------
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_ADDR 0x3C
 
-// --- NEW PIN MAP (FROM YOUR PLAN) ---
-#define PIN_BUZZER 14 //
-#define BTN_UP     26 //
-#define BTN_DOWN   33 //
-#define BTN_LEFT   25 //
-#define BTN_RIGHT  27 
-#define BTN_OK     32
-// BUZZER_CHANNEL is no longer needed
+// --- *** FIX #1: YOUR NEW PIN MAP *** ---
+#define PIN_BUZZER 14
+#define BTN_UP     26  // Was 32
+#define BTN_DOWN   33  // Was 33
+#define BTN_LEFT   25  // Was 25
+#define BTN_RIGHT  27  // Was 26
+#define BTN_OK     32  // Was 27
+// -----------------------------------------
 
 // Wi-Fi AP creds
 const char *AP_SSID = "PicchiBot";
@@ -76,29 +76,34 @@ float globalWeatherTemp = -99;
 bool globalIsConnected = false;
 
 // --- UI State (Core 1 Only) ---
-enum Screen { SCR_PET, SCR_MENU, SCR_WEATHER };
+enum Screen { SCR_PET, SCR_MENU, SCR_WEATHER, SCR_TIMER_SETUP };
 Screen currentScreen = SCR_PET;
 
 int menuIndex = 0;
-String menuItems[] = {"Weather", "Reboot", "Exit"};
-int menuItemCount = 3;
+// *** FIX #4: Added Timer to menu ***
+String menuItems[] = {"Weather", "Timer", "Reboot", "Exit"};
+int menuItemCount = 4;
 
 unsigned long lastButtonPress = 0;
 unsigned long debounceDelay = 200;
 
+// --- FIX #4: Countdown Timer Globals ---
+bool countdownRunning = false;
+unsigned long countdownRemaining = 0; // ms
+unsigned long countdownTick = 0;
+unsigned long timerSetupSeconds = 30; // Default 30s
+
+
 // ----------------- HELPER SOUNDS -----------------
-// *** FIX #2: Replaced ledc with tone() ***
 void beep(int freq, int duration) {
   tone(PIN_BUZZER, freq, duration);
-  // We add a small delay so the sound can play.
-  // This is a tradeoff for not using the non-blocking ledc.
-  delay(duration + 10); 
+  delay(duration + 10);
 }
 
 // =======================================================
 //  CORE 0 - NETWORK TASK
 // =======================================================
-// (This section is unchanged)
+// (This section is unchanged from Part 7)
 WebServer webServer(80);
 DNSServer dnsServer;
 
@@ -112,12 +117,10 @@ void handleRoot() {
   page += "</body></html>";
   webServer.send(200, "text/html", page);
 }
-
 void handleSave() {
   String savedSSID = webServer.arg("ssid");
   String savedPASS = webServer.arg("pass");
   String savedCity = webServer.arg("city");
-
   if (savedSSID.length() > 0) {
     prefs.begin("picchi", false);
     prefs.putString("city", savedCity);
@@ -132,11 +135,8 @@ void handleSave() {
     webServer.send(400, "text/plain", "missing");
   }
 }
-
 void fetchWeather() {
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
+  if (WiFi.status() != WL_CONNECTED) return;
   prefs.begin("picchi", true);
   String city = prefs.getString("city", "Dhaka");
   String country = prefs.getString("country", "BD");
@@ -168,7 +168,6 @@ void fetchWeather() {
   portEXIT_CRITICAL(&stateMux);
   Serial.print("Weather updated: "); Serial.print(temp); Serial.println("C");
 }
-
 void taskNetwork(void *pvParameters) {
   Serial.println("Network Task started on Core 0");
   prefs.begin("picchi", true);
@@ -187,9 +186,7 @@ void taskNetwork(void *pvParameters) {
       Serial.print(".");
       retries++;
     }
-    if (WiFi.status() == WL_CONNECTED) {
-      connected = true;
-    }
+    if (WiFi.status() == WL_CONNECTED) connected = true;
   }
   portENTER_CRITICAL(&stateMux);
   if (connected) {
@@ -227,6 +224,43 @@ void taskNetwork(void *pvParameters) {
     }
   }
 }
+// =======================================================
+//  END OF NETWORK TASK
+// =======================================================
+
+
+// --- *** FIX #3: YOUR BOOT ANIMATION *** ---
+void showBootIntro() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(WHITE);
+
+  // glitch/cyber effect
+  for (int i=0;i<6;i++){
+    display.clearDisplay();
+    int x = random(-6,6);
+    int y = random(-4,4);
+    display.setCursor(8 + x, 6 + y);
+    display.println("PicchiBot"); // Changed to 2 lines
+    display.setTextSize(1);
+    display.setCursor(20 + x, 40 + y);
+    display.println("by Lian"); // Changed
+    display.display();
+    beep(1000 + i*200, 60);
+  }
+  // final stable
+  display.clearDisplay();
+  display.setTextSize(2); // Set size for "PicchiBot"
+  display.setCursor(10, 20); // Centered
+  display.println("PicchiBot");
+  display.setTextSize(1);
+  display.setCursor(40, 45);
+  display.println("by Lian");
+  display.display();
+  beep(1800, 150);
+  delay(1500);
+}
+
 
 // =======================================================
 //  SETUP()
@@ -240,8 +274,6 @@ void setup() {
   pinMode(BTN_LEFT, INPUT_PULLUP);
   pinMode(BTN_RIGHT, INPUT_PULLUP);
   pinMode(BTN_OK, INPUT_PULLUP);
-
-  // *** FIX #2: Replaced ledcSetup/ledcAttachPin ***
   pinMode(PIN_BUZZER, OUTPUT);
 
   Wire.begin(21, 22); // Explicit SDA, SCL
@@ -253,6 +285,7 @@ void setup() {
   display.clearDisplay();
 
   // --- Manual Wi-Fi Reset Check ---
+  // *** USES NEW PIN: BTN_OK (32) ***
   if (digitalRead(BTN_OK) == LOW) {
     display.clearDisplay();
     display.setTextSize(1);
@@ -274,24 +307,17 @@ void setup() {
   eyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 50);
   eyes.setAutoblinker(true, 2, 4);
   eyes.setIdleMode(true, 3, 4);
-  eyes.open();
+  eyes.open(); // Start with eyes open
 
   mpu.begin();
   Serial.println("Calculating MPU offsets...");
   mpu.calcOffsets(true, true);
-  Serial.println("MPU Done."); // *** FIX: Added missing parenthesis ***
+  Serial.println("MPU Done.");
 
-  // --- Boot Animation ---
-  eyes.anim_wake_dramatic();
-  for(int i=0; i<30; i++) { eyes.update(); delay(20); }
-  beep(1200, 80);
+  // --- *** FIX #3: Play Your Boot Animation *** ---
+  showBootIntro();
   
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setCursor(10, 20);
-  display.println("PicchiBot");
-  display.display();
-  delay(1500);
+  // After intro, show the pet
   eyes.open();
 
   // --- START THE NETWORK TASK (Core 0) ---
@@ -313,12 +339,12 @@ void setup() {
 //  LOOP() - CORE 1 - UI TASK
 // =======================================================
 void loop() {
-  // --- Global Button Reads ---
-  bool btnUp = (digitalRead(BTN_UP) == LOW);
-  bool btnDown = (digitalRead(BTN_DOWN) == LOW);
-  bool btnLeft = (digitalRead(BTN_LEFT) == LOW);
-  bool btnRight = (digitalRead(BTN_RIGHT) == LOW);
-  bool btnOk = (digitalRead(BTN_OK) == LOW);
+  // --- Global Button Reads (using NEW pins) ---
+  bool btnUp = (digitalRead(BTN_UP) == LOW);       // 26
+  bool btnDown = (digitalRead(BTN_DOWN) == LOW);   // 33
+  bool btnLeft = (digitalRead(BTN_LEFT) == LOW);   // 25
+  bool btnRight = (digitalRead(BTN_RIGHT) == LOW); // 27
+  bool btnOk = (digitalRead(BTN_OK) == LOW);       // 32
 
   // --- Main UI State Machine ---
   switch (currentScreen) {
@@ -331,6 +357,31 @@ void loop() {
     case SCR_WEATHER:
       handleWeatherScreen(btnUp, btnDown, btnLeft, btnRight, btnOk);
       break;
+    // --- FIX #4: Added Timer setup screen ---
+    case SCR_TIMER_SETUP:
+      handleTimerSetupScreen(btnUp, btnDown, btnLeft, btnRight, btnOk);
+      break;
+  }
+  
+  // --- FIX #4: Global Countdown Timer Logic ---
+  // This runs in the background, no matter what screen you are on.
+  if (countdownRunning) {
+    if (millis() - countdownTick >= 500) { // Every half-second
+      countdownRemaining = (countdownRemaining > 500) ? countdownRemaining - 500 : 0;
+      countdownTick = millis();
+
+      if (countdownRemaining == 0) {
+        countdownRunning = false;
+        // Big "boom"
+        beep(1200, 200);
+        delay(100);
+        beep(900, 200);
+      } else {
+        // Prank "bomb" beep, gets faster
+        int beepFreq = 600 + (int)((1.0 - (float)countdownRemaining / 30000.0) * 1000);
+        beep(beepFreq, 80);
+      }
+    }
   }
 
   // This is the ONLY place eyes.update() should be called.
@@ -349,40 +400,37 @@ void handlePetScreen(bool up, bool down, bool left, bool right, bool ok) {
   // --- MPU6050 Eye Control (High Sensitivity) ---
   mpu.update();
   float ax = mpu.getAngleX();
-  
-  // *** FIX #3: 'mpy' typo corrected to 'mpu' ***
-  float ay = mpu.getAngleY(); 
+  float ay = mpu.getAngleY(); // Corrected 'mpy' typo
 
-  // Map a small tilt (-15 to +15 deg) to the full eye range
   int posX = map((int)ay, -15, 15, 0, eyes.getScreenConstraint_X());
   int posY = map((int)ax, -15, 15, 0, eyes.getScreenConstraint_Y());
-
-  // Constrain ensures we don't go out of bounds if tilted > 15 deg
   eyes.eyeLxNext = constrain(posX, 0, eyes.getScreenConstraint_X());
   eyes.eyeLyNext = constrain(posY, 0, eyes.getScreenConstraint_Y());
 
-  // --- Button Inputs ---
+  // --- Button Inputs (using NEW pins) ---
   if ((millis() - lastButtonPress) > debounceDelay) {
-    if (left || right) {
-      // Petting
+    if (left) { // BTN_LEFT (25)
       eyes.anim_happy();
       beep(1500,80);
       lastButtonPress = millis();
     }
-    
-    if (up) {
+    if (right) { // BTN_RIGHT (27)
+      // For now, also pet. We can change this.
+      eyes.anim_happy();
+      beep(1600, 80);
+      lastButtonPress = millis();
+    }
+    if (up) { // BTN_UP (26)
       eyes.anim_shocked();
       beep(1800, 80);
       lastButtonPress = millis();
     }
-
-    if (down) {
+    if (down) { // BTN_DOWN (33)
       eyes.anim_sad();
       beep(400, 100);
       lastButtonPress = millis();
     }
-    
-    if (ok) {
+    if (ok) { // BTN_OK (32)
       // Go to Menu
       beep(800, 50);
       currentScreen = SCR_MENU;
@@ -396,7 +444,6 @@ void handlePetScreen(bool up, bool down, bool left, bool right, bool ok) {
   display.setTextColor(WHITE);
   display.setCursor(0,0);
   
-  // Safely read the IP
   String ip;
   portENTER_CRITICAL(&stateMux);
   ip = globalIP;
@@ -405,23 +452,26 @@ void handlePetScreen(bool up, bool down, bool left, bool right, bool ok) {
 }
 
 void handleMenuScreen(bool up, bool down, bool left, bool right, bool ok) {
-  // --- Handle Menu Navigation ---
+  // --- Handle Menu Navigation (using NEW pins) ---
   if ((millis() - lastButtonPress) > debounceDelay) {
-    if (down) {
+    if (down) { // BTN_DOWN (33)
       menuIndex = (menuIndex + 1) % menuItemCount;
       beep(1000, 50);
       lastButtonPress = millis();
     }
-    if (up) {
+    if (up) { // BTN_UP (26)
       menuIndex = (menuIndex - 1 + menuItemCount) % menuItemCount;
       beep(1000, 50);
       lastButtonPress = millis();
     }
-    if (ok) {
-      // Select Item
+    if (ok) { // BTN_OK (32)
       beep(1200, 80);
       if (menuItems[menuIndex] == "Weather") {
         currentScreen = SCR_WEATHER;
+      }
+      if (menuItems[menuIndex] == "Timer") {
+        currentScreen = SCR_TIMER_SETUP; // Go to timer setup
+        timerSetupSeconds = 30; // Reset to default
       }
       if (menuItems[menuIndex] == "Reboot") {
         display.clearDisplay();
@@ -436,8 +486,7 @@ void handleMenuScreen(bool up, bool down, bool left, bool right, bool ok) {
       }
       lastButtonPress = millis();
     }
-    if (left) {
-      // Back to Pet
+    if (left) { // BTN_LEFT (25) - Use as "Back"
       beep(800, 50);
       currentScreen = SCR_PET;
       lastButtonPress = millis();
@@ -465,7 +514,6 @@ void handleMenuScreen(bool up, bool down, bool left, bool right, bool ok) {
 }
 
 void handleWeatherScreen(bool up, bool down, bool left, bool right, bool ok) {
-  // --- Safely read the weather data ---
   float temp;
   String cond;
   portENTER_CRITICAL(&stateMux);
@@ -473,32 +521,80 @@ void handleWeatherScreen(bool up, bool down, bool left, bool right, bool ok) {
   cond = globalWeatherCond;
   portEXIT_CRITICAL(&stateMux);
 
-  // --- Draw the Weather Screen ---
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(WHITE);
   display.setCursor(15, 0);
   display.println("--- WEATHER ---");
-  
   display.setTextSize(2);
   display.setCursor(10, 20);
   display.print(temp, 1);
   display.print("C");
-  
   display.setTextSize(1);
   display.setCursor(10, 40);
   display.print(cond);
-  
-  display.setCursor(20, 55);
-  display.print("(Press LEFT to Exit)");
+  display.setCursor(10, 55);
+  display.print("(Press LEFT or OK)");
   display.display();
   
-  // --- Handle Input ---
   if ((millis() - lastButtonPress) > debounceDelay) {
-    if (left || ok) {
+    if (left || ok) { // Use LEFT (25) or OK (32)
       beep(800, 50);
       currentScreen = SCR_MENU; // Go back to menu
       lastButtonPress = millis();
     }
   }
+}
+
+// --- *** FIX #4: New Timer Setup Screen *** ---
+void handleTimerSetupScreen(bool up, bool down, bool left, bool right, bool ok) {
+  // --- Handle Input ---
+  if ((millis() - lastButtonPress) > debounceDelay) {
+    if (up) { // BTN_UP (26)
+      timerSetupSeconds += 5;
+      if (timerSetupSeconds > 300) timerSetupSeconds = 300; // 5 min max
+      beep(1100, 50);
+      lastButtonPress = millis();
+    }
+    if (down) { // BTN_DOWN (33)
+      timerSetupSeconds -= 5;
+      if (timerSetupSeconds < 5) timerSetupSeconds = 5; // 5 sec min
+      beep(900, 50);
+      lastButtonPress = millis();
+    }
+    if (ok) { // BTN_OK (32)
+      // START the timer
+      countdownRemaining = timerSetupSeconds * 1000;
+      countdownTick = millis();
+      countdownRunning = true;
+      currentScreen = SCR_PET; // Go back to pet screen
+      beep(1400, 100);
+      lastButtonPress = millis();
+    }
+    if (left) { // BTN_LEFT (25)
+      // CANCEL / Back
+      beep(800, 50);
+      currentScreen = SCR_MENU; // Go back to menu
+      lastButtonPress = millis();
+    }
+  }
+
+  // --- Draw Screen ---
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(10, 0);
+  display.println("--- PRANK TIMER ---");
+  
+  display.setTextSize(2);
+  display.setCursor(35, 20);
+  display.print(timerSetupSeconds);
+  display.println("s");
+  
+  display.setTextSize(1);
+  display.setCursor(10, 45);
+  display.print("UP/DOWN to change");
+  display.setCursor(10, 55);
+  display.print("OK to start, LEFT to exit");
+  display.display();
 }
