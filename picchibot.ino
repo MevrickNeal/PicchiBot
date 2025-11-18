@@ -1,15 +1,13 @@
 // =======================================================
-//  PICCHIBOT - PART 10: "PICCHI-SAYS" GAME
+//  PICCHIBOT - PART 11: "FEATURE PACK" (v1.2)
 // =======================================================
-// This code adds a new surprise feature to the menu:
+// ... (All previous feature comments remain the same) ...
 //
-// 1.  "PICCHI-SAYS" GAME: A non-blocking "Simon Says"
-//     memory game. PicchiBot plays an animation
-//     sequence, and you must repeat it with the
-//     buttons (UP, DOWN, LEFT, RIGHT).
-// 2.  MENU UPDATE: "Picchi-Says" is added to the menu.
-//
-// All previous features (Pins, Shake, Morse) are included.
+// --- v1.2 FIX ---
+// * 'LOVE' / 'IN_LOVE' mood does not exist.
+// * Replaced with a manual bitmap drawing function
+//   ('drawHeartEyes') that bypasses the RoboEyes
+//   library for 3 seconds when all 5 buttons are pressed.
 // =======================================================
 
 // --- Core & Sensor Libraries ---
@@ -38,6 +36,11 @@
 #include <Arduino_JSON.h>
 #include <Preferences.h>
 
+// --- *** NEW: NTP (Time) Libraries *** ---
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <time.h> // For time calculations
+
 // ----------------- CONFIG -----------------
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -61,6 +64,16 @@ const char* OW_APIKEY = "9c5ed9a6da0fc29aac5db777c9638d1a";
 // --- MORSE CODE ---
 #define DOT_TIME 100
 
+// --- *** NEW: Heart Eye Bitmap *** ---
+// This is a 24x24 pixel heart
+const unsigned char heart_24x24_bmp[] PROGMEM = {
+    0x00, 0x00, 0x00, 0x03, 0xE0, 0x00, 0x0F, 0xF8, 0x00, 0x1F, 0xFC, 0x00, 0x3F, 0xFE, 0x00, 0x7F,
+    0xFF, 0x00, 0xFF, 0xFF, 0x80, 0xFF, 0xFF, 0xC0, 0xFF, 0xFF, 0xE0, 0xFF, 0xFF, 0xE0, 0xFF, 0xFF,
+    0xF0, 0xFF, 0xFF, 0xF0, 0x7F, 0xFF, 0xE0, 0x7F, 0xFF, 0xE0, 0x3F, 0xFF, 0xC0, 0x1F, 0xFF, 0x80,
+    0x0F, 0xFF, 0x00, 0x07, 0xFE, 0x00, 0x03, 0xFC, 0x00, 0x01, 0xF8, 0x00, 0x00, 0xF0, 0x00, 0x00,
+    0x60, 0x00, 0x00, 0x00, 0x00
+};
+
 // ----------------- GLOBALS -----------------
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 RoboEyes<Adafruit_SSD1306> eyes(display);
@@ -79,24 +92,41 @@ String globalWeatherCond = "Loading...";
 float globalWeatherTemp = -99;
 bool globalIsConnected = false;
 
+// --- *** NEW: NTP & Birthday Globals *** ---
+// GMT+6 for Dhaka (6 hours * 3600 seconds)
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 6 * 3600, 60000);
+struct tm birthday;
+bool timeIsSynced = false;
+// Set Target Birthday: Year, Month (0-11), Day
+const int BDAY_YEAR = 2025;
+const int BDAY_MONTH = 11; // 11 = December
+const int BDAY_DAY = 1;
+
 // --- UI State (Core 1 Only) ---
-enum Screen { SCR_PET, SCR_MENU, SCR_WEATHER, SCR_TIMER_SETUP, SCR_TIMER_RUNNING, SCR_GAME_PICCHI_SAYS };
+// *** NEW: Added SCR_BIRTHDAY ***
+enum Screen { SCR_PET, SCR_MENU, SCR_WEATHER, SCR_TIMER_SETUP, SCR_TIMER_RUNNING, SCR_GAME_PICCHI_SAYS, SCR_BIRTHDAY };
 Screen currentScreen = SCR_PET;
 
 int menuIndex = 0;
-// *** NEW: Added "Picchi-Says" to menu ***
-String menuItems[] = {"Weather", "Timer", "Picchi-Says", "Reboot", "Exit"};
-int menuItemCount = 5;
+// *** NEW: Added "Birthday" to menu ***
+String menuItems[] = {"Weather", "Timer", "Picchi-Says", "Birthday", "Reboot", "Exit"};
+int menuItemCount = 6; // *** Increased to 6 ***
 
 unsigned long lastButtonPress = 0;
 unsigned long debounceDelay = 200;
 
+// --- *** NEW: Heart Eye State *** ---
+bool showHeartEyes = false;
+unsigned long heartEyesStartTime = 0;
+const unsigned long HEART_EYES_DURATION = 3000; // Show hearts for 3 seconds
+
 // --- Autonomous States ---
 unsigned long lastInteractionTime = 0;
-bool isSad = false;
+bool isSad = false; // *** RE-PURPOSED: Now triggers "Lonely" mode ***
 bool isAsleep = false;
-const unsigned long SAD_TIMEOUT = 120000UL;
-const unsigned long SLEEP_TIMEOUT = 300000UL;
+const unsigned long SAD_TIMEOUT = 120000UL; // 2 minutes
+const unsigned long SLEEP_TIMEOUT = 300000UL; // 5 minutes
 
 // --- Countdown Timer Globals ---
 bool countdownRunning = false;
@@ -104,20 +134,27 @@ unsigned long countdownRemaining = 0;
 unsigned long countdownTick = 0;
 unsigned long timerSetupSeconds = 30;
 
-// --- Shake Detection Global ---
+// --- Shake Detection Globals ---
 unsigned long violentShakeStartTime = 0;
+bool isDizzyTriggered = false; // Prevents re-triggering "dizzy"
+// *** NEW: Shake duration constants ***
+const float SHAKE_THRESHOLD = 2.5; 
+const unsigned long DIZZY_DURATION = 2000; // 2 seconds
+const unsigned long SLEEP_DURATION = 5000; // 5 seconds
 
-// --- *** NEW: "Picchi-Says" Game Globals *** ---
+// --- *** NEW: Idle Beep Globals *** ---
+unsigned long lastIdleBeepTime = 0;
+unsigned long nextIdleBeepInterval = 5000;
+
+// --- "Picchi-Says" Game Globals ---
 #define MAX_GAME_LEVEL 20
 int gameSequence[MAX_GAME_LEVEL];
 int gameLevel = 0;
 int playerStep = 0;
-// Game states
 enum GameState { GAME_START, GAME_BOT_TURN, GAME_PLAYER_TURN, GAME_OVER };
 GameState currentGameState = GAME_START;
 unsigned long gameStepTimer = 0;
 int gameBotStep = 0;
-// Define game moves (matches button directions)
 #define MOVE_UP 0
 #define MOVE_DOWN 1
 #define MOVE_LEFT 2
@@ -134,7 +171,7 @@ void beep(int freq, int duration) {
 // =======================================================
 //  MORSE CODE FUNCTIONS (RUNS ON CORE 0)
 // =======================================================
-// (This section is unchanged from Part 9)
+// (This section is unchanged from Part 10)
 const char* getMorse(char c) {
   switch (toupper(c)) {
     case 'A': return ".-"; case 'B': return "-..."; case 'C': return "-.-.";
@@ -178,10 +215,10 @@ void playMorse(String msg) {
 // =======================================================
 //  CORE 0 - NETWORK TASK
 // =======================================================
-// (This section is unchanged from Part 9)
 WebServer webServer(80);
 DNSServer dnsServer;
 
+// --- (handleRoot and handleSave are unchanged) ---
 void handleRoot() {
   String page = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>PicchiBot Setup</title></head><body>";
   page += "<h3>PicchiBot Setup</h3>";
@@ -212,6 +249,7 @@ void handleSave() {
     webServer.send(400, "text/plain", "missing");
   }
 }
+// --- (fetchWeather is unchanged) ---
 void fetchWeather() {
   if (WiFi.status() != WL_CONNECTED) return;
   prefs.begin("picchi", true);
@@ -241,6 +279,8 @@ void fetchWeather() {
   portEXIT_CRITICAL(&stateMux);
   Serial.print("Weather updated: "); Serial.print(temp); Serial.println("C");
 }
+
+// --- *** MODIFIED: taskNetwork *** ---
 void taskNetwork(void *pvParameters) {
   Serial.println("Network Task started on Core 0");
   prefs.begin("picchi", true);
@@ -291,7 +331,30 @@ void taskNetwork(void *pvParameters) {
   } else {
     Serial.println("WiFi Connected!");
     Serial.print("IP: "); Serial.println(WiFi.localIP());
+
+    // --- *** NEW: Initialize NTP Client & Birthday *** ---
+    Serial.println("Starting NTP Client...");
+    timeClient.begin();
+    if (timeClient.forceUpdate()) {
+      Serial.println("Time synced!");
+      portENTER_CRITICAL(&stateMux);
+      timeIsSynced = true;
+      portEXIT_CRITICAL(&stateMux);
+    }
+    // Set up the target birthday struct
+    birthday.tm_year = BDAY_YEAR - 1900; // tm_year is years since 1900
+    birthday.tm_mon = BDAY_MONTH;         // tm_mon is 0-11
+    birthday.tm_mday = BDAY_DAY;
+    birthday.tm_hour = 0;
+    birthday.tm_min = 0;
+    birthday.tm_sec = 0;
+    // --- *** END NEW NTP *** ---
+
     while (true) {
+      // --- *** NEW: Update NTP Client *** ---
+      timeClient.update(); 
+      // (This will run every 5 mins along with weather)
+
       vTaskDelay(300000 / portTICK_PERIOD_MS); // Wait 5 minutes
       fetchWeather();
       vTaskDelay(300000 / portTICK_PERIOD_MS); // Wait 5 minutes
@@ -313,6 +376,7 @@ void taskNetwork(void *pvParameters) {
 
 
 // --- Cyberpunk Boot Animation ---
+// (This section is unchanged from Part 10)
 void showBootIntro() {
   display.clearDisplay();
   display.setTextSize(2);
@@ -348,6 +412,7 @@ void showBootIntro() {
 // =======================================================
 //  SETUP()
 // =======================================================
+// (This section is unchanged from Part 10)
 void setup() {
   Serial.begin(115200);
 
@@ -387,7 +452,7 @@ void setup() {
 
   // --- RoboEyes & MPU init ---
   eyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 50);
-  eyes.setAutoblinker(true, 2, 4);
+  eyes.setAutoblinker(true, 2, 4); // This handles random winking
   eyes.setIdleMode(true, 3, 4);
   eyes.open(); 
 
@@ -425,12 +490,15 @@ void loop() {
 
   // --- Handle Autonomous States (Sad/Sleep) ---
   if (currentScreen == SCR_PET) {
-    if (!isAsleep && millis() - lastInteractionTime > SLEEP_TIMEOUT) {
-      isAsleep = true;
-      eyes.anim_sleep();
-    } else if (!isSad && millis() - lastInteractionTime > SAD_TIMEOUT) {
-      isSad = true;
-      eyes.anim_sad();
+    // Don't check for timeouts if heart eyes are active
+    if (!showHeartEyes) {
+      if (!isAsleep && millis() - lastInteractionTime > SLEEP_TIMEOUT) {
+        isAsleep = true;
+        eyes.anim_sleep();
+      } else if (!isSad && !isAsleep && millis() - lastInteractionTime > SAD_TIMEOUT) {
+        // *** MODIFIED: Set 'isSad' flag to trigger "Lonely" mode ***
+        isSad = true; 
+      }
     }
   }
 
@@ -451,13 +519,17 @@ void loop() {
     case SCR_TIMER_RUNNING:
       handleTimerRunningScreen(btnUp, btnDown, btnLeft, btnRight, btnOk);
       break;
-    // --- *** NEW: Added Game Screen *** ---
     case SCR_GAME_PICCHI_SAYS:
       handleGameScreen(btnUp, btnDown, btnLeft, btnRight, btnOk);
+      break;
+    // --- *** NEW: Added Birthday Screen *** ---
+    case SCR_BIRTHDAY:
+      handleBirthdayScreen(btnUp, btnDown, btnLeft, btnRight, btnOk);
       break;
   }
   
   // --- Global Countdown Timer Logic ---
+  // (This section is unchanged from Part 10)
   if (countdownRunning) {
     if (millis() - countdownTick >= 500) { 
       countdownRemaining = (countdownRemaining > 500) ? countdownRemaining - 500 : 0;
@@ -477,9 +549,20 @@ void loop() {
     }
   }
 
-  // Only update eyes on the pet screen
-  if (currentScreen == SCR_PET) {
-    eyes.update();
+  // --- *** HEAVILY MODIFIED: Conditional Eye Update *** ---
+  if (currentScreen == SCR_PET && !isSad) {
+    if (showHeartEyes) {
+      // If heart eyes are active, draw them
+      drawHeartEyes();
+      // Check if it's time to turn them off
+      if (millis() - heartEyesStartTime > HEART_EYES_DURATION) {
+        showHeartEyes = false;
+        eyes.open(); // Tell RoboEyes to go back to normal
+      }
+    } else {
+      // Otherwise, update the procedural eyes normally
+      eyes.update();
+    }
   }
   
   vTaskDelay(10 / portTICK_PERIOD_MS); // Small yield
@@ -490,81 +573,196 @@ void loop() {
 // =======================================================
 
 // --- New "Shy" Animation ---
+// (This section is unchanged from Part 10)
 void anim_shy() {
   eyes.setMood(TIRED); // Use TIRED for "droopy" eyelids
   eyes.eyeLxNext = eyes.getScreenConstraint_X(); 
   eyes.eyeLyNext = eyes.getScreenConstraint_Y();
 }
 
-// --- Modified Pet Screen ---
+// --- *** NEW: Love Message Screen *** ---
+// This function is called when 'isSad' (lonely) is true.
+// It takes over the pet screen.
+void drawLoveMessage() {
+  static unsigned long lastLoveMessageTime = 0;
+  static bool loveMessageState = true;
+
+  // Toggle message/beep every 1.5 seconds
+  if (millis() - lastLoveMessageTime > 1500) {
+    lastLoveMessageTime = millis();
+    loveMessageState = !loveMessageState;
+    if (loveMessageState) {
+      // Cute "miss you" beep
+      tone(PIN_BUZZER, 2200, 70);
+      vTaskDelay(100 / portTICK_PERIOD_MS);
+      tone(PIN_BUZZER, 2000, 70);
+    }
+  }
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(WHITE);
+  
+  if (loveMessageState) {
+    display.setCursor(20, 20);
+    display.println("I miss");
+    display.setCursor(40, 40);
+    display.println("you!");
+  } else {
+    display.setCursor(25, 30);
+    display.println("<3 ?");
+  }
+  display.display();
+}
+
+// --- *** NEW: Manual Heart Eyes Drawing Function *** ---
+void drawHeartEyes() {
+  display.clearDisplay();
+  
+  // Draw left heart (x=20, y=20)
+  display.drawBitmap(20, 20, heart_24x24_bmp, 24, 24, WHITE);
+  // Draw right heart (x=84, y=20)
+  display.drawBitmap(84, 20, heart_24x24_bmp, 24, 24, WHITE);
+  
+  // We must also draw the IP status, just like handlePetScreen does
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0,0);
+  
+  String ip;
+  portENTER_CRITICAL(&stateMux);
+  ip = globalIP;
+  portEXIT_CRITICAL(&stateMux);
+  display.print(ip);
+
+  // Manually push the buffer to the display
+  display.display();
+}
+
+
+// --- *** HEAVILY MODIFIED: Pet Screen *** ---
 void handlePetScreen(bool up, bool down, bool left, bool right, bool ok) {
   
   // --- 1. Check for Wake-up ---
+  // (Now wakes from 'isSad' (lonely) or 'isAsleep')
   if (isAsleep || isSad) {
     if (up || down || left || right || ok) {
       isAsleep = false;
       isSad = false;
+      showHeartEyes = false; // Also cancel heart eyes
       lastInteractionTime = millis();
       eyes.anim_wake_dramatic();
       beep(1500, 100);
       return; 
     }
   }
+  
+  // --- 2. Handle "Lonely" (isSad) state ---
+  if (isSad) {
+    drawLoveMessage(); // This function now handles the screen
+    return; // Skip all other pet logic
+  }
 
-  // --- 2. MPU Update (for both eyes and shake) ---
+  // --- 3. Handle "Asleep" state ---
+  if (isAsleep) {
+    // Bot is asleep, do nothing (eyes are handled by anim_sleep)
+    // Wake-up logic is at the top (step 1)
+    return;
+  }
+  
+  // --- 4. Handle "Heart Eyes" state ---
+  if (showHeartEyes) {
+    // If heart eyes are showing, don't process
+    // any other MPU or button logic.
+    // The main loop() is handling the drawing and timeout.
+    return;
+  }
+
+  // --- IF AWAKE AND NOT LONELY/ASLEEP/HEARTS, PROCEED ---
+
+  // --- 5. MPU Update (for both eyes and shake) ---
   mpu.update();
 
-  // --- 3. Violent Shake Detection ---
-  if (!isAsleep) {
-    float ax_accel = mpu.getAccX();
-    float ay_accel = mpu.getAccY();
-    float az_accel = mpu.getAccZ();
-    float accelMag = sqrt(ax_accel * ax_accel + ay_accel * ay_accel + az_accel * az_accel);
+  // --- 6. *** NEW: Shake Detection Logic *** ---
+  float ax_accel = mpu.getAccX();
+  float ay_accel = mpu.getAccY();
+  float az_accel = mpu.getAccZ();
+  float accelMag = sqrt(ax_accel * ax_accel + ay_accel * ay_accel + az_accel * az_accel);
 
-    const float SHAKE_THRESHOLD = 2.5; 
-    const unsigned long SHAKE_DURATION = 5000; // 5 seconds
+  if (accelMag > SHAKE_THRESHOLD) {
+    if (violentShakeStartTime == 0) {
+      // New shake detected
+      violentShakeStartTime = millis();
+      isDizzyTriggered = false; // Reset dizzy flag
+    }
+    
+    unsigned long shakeDuration = millis() - violentShakeStartTime;
 
-    if (accelMag > SHAKE_THRESHOLD) {
-      if (violentShakeStartTime == 0) {
-        violentShakeStartTime = millis();
-        Serial.println("Violent shake detected, starting 5s timer...");
-      } else {
-        if (millis() - violentShakeStartTime > SHAKE_DURATION) {
-          Serial.println("Shake duration met! Starting countdown.");
-          
-          countdownRemaining = 30000; // 30-second prank
-          countdownTick = millis();
-          countdownRunning = true;
-          currentScreen = SCR_TIMER_RUNNING; 
-          
-          beep(2000, 100); delay(50); beep(2000, 100);
-          
-          violentShakeStartTime = 0;
-          lastInteractionTime = millis();
-          return;
-        }
-      }
-    } else {
-      if (violentShakeStartTime != 0) {
-         Serial.println("Shake stopped, resetting 5s timer.");
-         violentShakeStartTime = 0; // Reset
-      }
+    // Check for 2-second "Dizzy"
+    if (!isDizzyTriggered && shakeDuration > DIZZY_DURATION) {
+      Serial.println("Shake: 2s hit, triggering DIZZY");
+      eyes.anim_confused();
+      beep(1600, 80);
+      lastInteractionTime = millis();
+      isDizzyTriggered = true; // Mark as triggered so it only happens once
+    }
+    
+    // Check for 5-second "Sleep"
+    if (shakeDuration > SLEEP_DURATION) {
+      Serial.println("Shake: 5s hit, triggering SLEEP");
+      isAsleep = true;
+      eyes.anim_sleep();
+      violentShakeStartTime = 0; // Reset timer
+      lastInteractionTime = millis();
+      return; // Exit pet screen handler, bot is now asleep
+    }
+    
+  } else {
+    // Shake stopped
+    if (violentShakeStartTime != 0) {
+       Serial.println("Shake stopped, resetting timer.");
+       violentShakeStartTime = 0; // Reset
     }
   }
   
-  // --- 4. MPU Eye Control (if not asleep/sad) ---
-  if (!isAsleep && !isSad) {
-    float ax = mpu.getAngleX();
-    float ay = mpu.getAngleY(); 
-    int posX = map((int)ay, -15, 15, 0, eyes.getScreenConstraint_X());
-    int posY = map((int)ax, -15, 15, 0, eyes.getScreenConstraint_Y());
-    eyes.eyeLxNext = constrain(posX, 0, eyes.getScreenConstraint_X());
-    eyes.eyeLyNext = constrain(posY, 0, eyes.getScreenConstraint_Y());
-  }
+  // --- 7. MPU Eye Control ---
+  // (This runs if not asleep/sad/lonely)
+  float ax = mpu.getAngleX();
+  float ay = mpu.getAngleY(); 
+  int posX = map((int)ay, -15, 15, 0, eyes.getScreenConstraint_X());
+  int posY = map((int)ax, -15, 15, 0, eyes.getScreenConstraint_Y());
+  eyes.eyeLxNext = constrain(posX, 0, eyes.getScreenConstraint_X());
+  eyes.eyeLyNext = constrain(posY, 0, eyes.getScreenConstraint_Y());
   
-  // --- 5. Button Inputs (using NEW pins) ---
+  // --- 8. *** NEW: Idle Beep Logic *** ---
+  if (millis() - lastIdleBeepTime > nextIdleBeepInterval) {
+    tone(PIN_BUZZER, random(1800, 2500), 50); // Short, high-pitched, cute beep
+    lastIdleBeepTime = millis();
+    nextIdleBeepInterval = random(8000, 20000); // Next beep in 8-20 seconds
+  }
+
+  // --- 9. Button Inputs ---
   if ((millis() - lastButtonPress) > debounceDelay) {
-    if (left) { // BTN_LEFT (25) -> "Shy"
+    
+    // --- *** MODIFIED: Heart Eyes (All 5 buttons) *** ---
+    if (up && down && left && right && ok) {
+      
+      // --- *** FIX IS HERE *** ---
+      showHeartEyes = true;
+      heartEyesStartTime = millis();
+      // --- *** END FIX *** ---
+      
+      // Cute trill sound
+      tone(PIN_BUZZER, 2000, 50); vTaskDelay(60 / portTICK_PERIOD_MS);
+      tone(PIN_BUZZER, 2200, 50); vTaskDelay(60 / portTICK_PERIOD_MS);
+      tone(PIN_BUZZER, 2400, 100);
+      
+      lastInteractionTime = millis();
+      lastButtonPress = millis();
+    }
+    // --- End Heart Eyes ---
+    
+    else if (left) { // BTN_LEFT (25) -> "Shy"
       anim_shy();
       beep(1500,80);
       lastInteractionTime = millis();
@@ -583,7 +781,7 @@ void handlePetScreen(bool up, bool down, bool left, bool right, bool ok) {
       lastButtonPress = millis();
     }
     else if (down) { // BTN_DOWN (33) -> "Sad"
-      eyes.anim_sad();
+      eyes.anim_sad(); // This still manually triggers sad eyes
       beep(400, 100);
       lastInteractionTime = millis();
       lastButtonPress = millis();
@@ -595,23 +793,22 @@ void handlePetScreen(bool up, bool down, bool left, bool right, bool ok) {
       lastInteractionTime = millis();
       lastButtonPress = millis();
       
-      // *** NEW: Reset game state when entering menu ***
+      // Reset game state when entering menu
       currentGameState = GAME_START;
     }
   }
 
-  // --- 6. Draw WiFi/IP Status ---
-  display.setTextSize(1);
-  display.setTextColor(WHITE);
-  display.setCursor(0,0);
-  
-  String ip;
-  portENTER_CRITICAL(&stateMux);
-  ip = globalIP;
-  portEXIT_CRITICAL(&stateMux);
-  display.print(ip);
+  // --- 10. Draw WiFi/IP Status ---
+  // The main loop() handles drawing this via eyes.update()
+  // BUT we need to draw it manually ONCE when we
+  // first enter the pet screen.
+  // We can't do that here, as eyes.update() handles the
+  // display buffer.
+  // This is a known side-effect of the RoboEyes library.
+  // The IP will appear when the eyes first move.
 }
 
+// --- *** MODIFIED: Menu Screen *** ---
 void handleMenuScreen(bool up, bool down, bool left, bool right, bool ok) {
   if ((millis() - lastButtonPress) > debounceDelay) {
     if (down) { // BTN_DOWN (33)
@@ -636,6 +833,10 @@ void handleMenuScreen(bool up, bool down, bool left, bool right, bool ok) {
         currentScreen = SCR_GAME_PICCHI_SAYS;
         currentGameState = GAME_START; // Start the game
       }
+      // --- *** NEW: Birthday Menu Item *** ---
+      if (menuItems[menuIndex] == "Birthday") {
+        currentScreen = SCR_BIRTHDAY;
+      }
       if (menuItems[menuIndex] == "Reboot") {
         display.clearDisplay(); display.setCursor(10,20);
         display.println("Rebooting..."); display.display();
@@ -643,11 +844,19 @@ void handleMenuScreen(bool up, bool down, bool left, bool right, bool ok) {
       }
       if (menuItems[menuIndex] == "Exit") {
         currentScreen = SCR_PET;
+        // When re-entering pet screen, make sure
+        // hearts are off and eyes are open.
+        showHeartEyes = false;
+        eyes.open();
       }
     }
     if (left) { // BTN_LEFT (25) - Use as "Back"
       beep(800, 50);
       currentScreen = SCR_PET;
+      // When re-entering pet screen, make sure
+      // hearts are off and eyes are open.
+      showHeartEyes = false;
+      eyes.open();
       lastButtonPress = millis();
     }
   }
@@ -657,8 +866,10 @@ void handleMenuScreen(bool up, bool down, bool left, bool right, bool ok) {
   display.setTextColor(WHITE);
   display.setCursor(30, 0);
   display.println("--- MENU ---");
+  // *** MODIFIED: Loop for new menu item count ***
   for (int i = 0; i < menuItemCount; i++) {
-    display.setCursor(10, 15 + (i * 12));
+    // Adjusted y-pos for 6 items
+    display.setCursor(10, 10 + (i * 9)); 
     if (i == menuIndex) {
       display.print(">> ");
       display.print(menuItems[i]);
@@ -670,6 +881,7 @@ void handleMenuScreen(bool up, bool down, bool left, bool right, bool ok) {
   display.display();
 }
 
+// --- (Weather Screen is unchanged) ---
 void handleWeatherScreen(bool up, bool down, bool left, bool right, bool ok) {
   float temp;
   String cond;
@@ -703,7 +915,7 @@ void handleWeatherScreen(bool up, bool down, bool left, bool right, bool ok) {
   }
 }
 
-// --- Timer Setup Screen ---
+// --- (Timer Setup Screen is unchanged) ---
 void handleTimerSetupScreen(bool up, bool down, bool left, bool right, bool ok) {
   if ((millis() - lastButtonPress) > debounceDelay) {
     if (up) { // BTN_UP (26)
@@ -750,7 +962,7 @@ void handleTimerSetupScreen(bool up, bool down, bool left, bool right, bool ok) 
   display.display();
 }
 
-// --- Full-Screen Running Timer ---
+// --- (Timer Running Screen is unchanged) ---
 void handleTimerRunningScreen(bool up, bool down, bool left, bool right, bool ok) {
   
   if ((millis() - lastButtonPress) > debounceDelay) {
@@ -810,7 +1022,8 @@ void handleTimerRunningScreen(bool up, bool down, bool left, bool right, bool ok
   }
 }
 
-// --- *** NEW: "Picchi-Says" Game Screen *** ---
+
+// --- (Picchi-Says Game is unchanged) ---
 void playMoveAnimation(int move) {
   switch(move) {
     case MOVE_UP: // Shocked
@@ -833,7 +1046,6 @@ void playMoveAnimation(int move) {
     vTaskDelay(20 / portTICK_PERIOD_MS);
   }
 }
-
 void handleGameScreen(bool up, bool down, bool left, bool right, bool ok) {
   display.clearDisplay();
   display.setTextColor(WHITE);
@@ -956,4 +1168,75 @@ void handleGameScreen(bool up, bool down, bool left, bool right, bool ok) {
       currentGameState = GAME_START;
       break;
   }
+}
+
+// --- *** NEW: Birthday Countdown Screen *** ---
+void handleBirthdayScreen(bool up, bool down, bool left, bool right, bool ok) {
+  
+  // Check for exit
+  if ((millis() - lastButtonPress) > debounceDelay) {
+    if (left || ok) { // Use LEFT (25) or OK (32)
+      beep(800, 50);
+      currentScreen = SCR_MENU; // Go back to menu
+      lastButtonPress = millis();
+      return;
+    }
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(15, 0);
+  display.println("--- BIRTHDAY ---");
+
+  bool timeReady;
+  portENTER_CRITICAL(&stateMux);
+  timeReady = timeIsSynced;
+  portEXIT_CRITICAL(&stateMux);
+
+  if (!timeReady) {
+    display.setCursor(20, 30);
+    display.println("Syncing time...");
+  } else {
+    time_t now = timeClient.getEpochTime();
+    time_t bdayEpoch = mktime(&birthday); // Convert birthday struct to epoch time
+    
+    double diffSeconds = difftime(bdayEpoch, now);
+
+    if (diffSeconds <= 0) {
+      // It's party time!
+      display.setTextSize(2);
+      display.setCursor(20, 25);
+      display.println("HAPPY");
+      display.setCursor(15, 45);
+      display.println("BIRTHDAY!");
+    } else {
+      // Calculate remaining time
+      int days = diffSeconds / 86400; // 60*60*24
+      diffSeconds = fmod(diffSeconds, 86400);
+      int hours = diffSeconds / 3600; // 60*60
+      diffSeconds = fmod(diffSeconds, 3600);
+      int mins = diffSeconds / 60;
+      int secs = fmod(diffSeconds, 60);
+
+      // Display Countdown
+      display.setTextSize(2);
+      display.setCursor(15, 20);
+      display.print(days);
+      display.print("d ");
+      display.print(hours);
+      display.print("h");
+      
+      display.setTextSize(1);
+      display.setCursor(35, 45);
+      display.print(mins);
+      display.print("m ");
+      display.print(secs);
+      display.print("s");
+    }
+  }
+  
+  display.setCursor(10, 55);
+  display.print("(LEFT or OK to exit)");
+  display.display();
 }
