@@ -1,17 +1,16 @@
 /***************************************************
-  PicchiBot v11.0 - Tick Tock Edition
+  PicchiBot v24.0 - Game Master & Physics Engine
   
   HARDWARE MAP:
   - OLED & MPU6050: SDA(21), SCL(22)
   - BUZZER:         GPIO 14
   - BUTTONS:        UP(26), DOWN(33), LEFT(25), RIGHT(27), OK(32)
 
-  CHANGELOG:
-  - [x] Bluetooth Removed (Lighter, Faster)
-  - [x] WiFi Manager: Standard Blocking Mode (Fixes "Can't Connect")
-  - [x] Timer: UI with Selection Box (Min/Sec) + Bomb Sound
-  - [x] Pomodoro: Logic fixed
-  - [x] Face: WiFi Icon added
+  FIXES:
+  - [x] Pong/DXBall: Fixed Ball "Tunneling" through paddle
+  - [x] DXBall: Added Powerups (+/-) and Infinite Levels
+  - [x] Timer/Pomo: 2s Hold to Start, 3s Hold to Exit
+  - [x] Network: Aggressive SSL/HTTP Fixes for News/AI
 ****************************************************/
 
 #include <Wire.h>
@@ -24,7 +23,6 @@
 #include <HTTPClient.h>
 #include <time.h>
 #include <ArduinoJson.h>
-#include <WiFiManager.h> 
 #include <Preferences.h>
 
 // --- 1. ASSETS ---
@@ -67,6 +65,7 @@
 
 const char* OW_APIKEY = "9c5ed9a6da0fc29aac5db777c9638d1a"; 
 const char* NEWS_API_KEY = "5df4945cab76462896d02c54d23ca77d"; 
+const char* GEMINI_API_KEY = "AIzaSyB_NfMMWJyxwrgkkG7cKUd74_MxUyMOePA"; 
 
 // --- 3. GLOBALS ---
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
@@ -76,14 +75,20 @@ Preferences preferences;
 char userName[32] = "Friend"; 
 bool wifiConnected = false;
 
-enum AppState { FACE, MENU, CLOCK, WEATHER, NEWS, GAME_DINO, GAME_FLAPPY, GAME_BRICK, TIMER, POMODORO, JOKE, ALERT_MODE };
+enum AppState { 
+  FACE, MENU, THERAPY, KEYBOARD, WIFI_SCAN, 
+  GAME_PONG, GAME_DINO, GAME_BRICK, 
+  CLOCK, WEATHER, NEWS, TIMER, POMODORO, JOKE, 
+  ALERT_MODE, AI_THINKING 
+};
 AppState currentState = FACE;
+AppState returnState = FACE; 
 
-const char* menuItems[] = { "Back to Face", "Timer", "Pomodoro", "Breaking News", "Dino Run", "Flappy Bot", "Brick Breaker", "Clock", "Weather", "Joke", "Reset WiFi" };
+const char* menuItems[] = { "Back to Face", "Table Tennis", "Brick Breaker", "Dino Run", "Timer", "Pomodoro", "Therapy (AI)", "News", "Clock", "Weather", "Joke", "WiFi Setup" };
 int menuIndex = 0;
-const int menuLen = 11;
+const int menuLen = 12;
 
-// Face Vars
+// Face
 const unsigned char* currentEye = normal;
 unsigned long lastBlink = 0;
 unsigned long lastSaccade = 0;
@@ -96,58 +101,67 @@ bool isSleeping = false;
 bool isAngry = false;
 bool isExcited = false;
 
-// Alert Vars
-unsigned long lastQuakeCheck = 0;
-unsigned long lastRainCheck = 0;
-String tempStr = "--";
-String weatherDesc = "Offline";
-String randomMsg = "Connect WiFi";
-String alertType = "";
-String alertInfo = "";
+// Therapy / AI
+unsigned long lastTherapyTime = 0;
+const unsigned long THERAPY_INTERVAL = 300000; 
+String aiResponse = "Hello! I am PicchiBot.";
+String keyboardBuffer = ""; 
+int keyboardTarget = 0; 
+String targetSSID = ""; 
+int aiScrollY = 0;
 
-// News Vars
-String newsTitle = "Loading...";
-String newsSource = "";
-int newsPage = 1;
-int newsScrollX = 128;
+// Keyboard
+int kbRow = 0; int kbCol = 0; int kbPage = 0;
+const char* keys[3][3][10] = {
+  { {"Q","W","E","R","T","Y","U","I","O","P"}, {"A","S","D","F","G","H","J","K","L","<"}, {"Z","X","C","V","B","N","M",".","_","^"} },
+  { {"q","w","e","r","t","y","u","i","o","p"}, {"a","s","d","f","g","h","j","k","l","<"}, {"z","x","c","v","b","n","m",",","_","^"} },
+  { {"1","2","3","4","5","6","7","8","9","0"}, {"!","@","#","$","%","&","*","-","+","<"}, {"(",")","?",":","/","=","!","'","_","^"} }
+};
+
+// WiFi Scan
+int wifiCount = 0; int wifiScroll = 0;
+
+// Games & Data
+float ballX=64, ballY=32, ballDX=2, ballDY=1.5; float paddleY=24, cpuY=24; int pScore=0, cScore=0;
+String tempStr = "--"; String weatherDesc = "Offline"; String randomMsg = "Connect WiFi";
+String newsTitle = "Loading..."; String newsSource = ""; int newsPage = 1; int newsScrollX = 128;
+unsigned long lastQuakeCheck = 0; unsigned long lastRainCheck = 0;
+String alertType = ""; String alertInfo = "";
+
+// Powerups
+struct PowerUp { float x, y; bool active; int type; }; // 0=Expand, 1=Shrink
+PowerUp pUp;
+int paddleWidth = 20; 
 
 // --- SETUP ---
 void setup() {
   Serial.begin(115200);
-  
-  pinMode(BTN_UP, INPUT_PULLUP);
-  pinMode(BTN_DOWN, INPUT_PULLUP);
-  pinMode(BTN_LEFT, INPUT_PULLUP);
-  pinMode(BTN_RIGHT, INPUT_PULLUP);
-  pinMode(BTN_OK, INPUT_PULLUP);
-  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(BTN_UP, INPUT_PULLUP); pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_LEFT, INPUT_PULLUP); pinMode(BTN_RIGHT, INPUT_PULLUP);
+  pinMode(BTN_OK, INPUT_PULLUP); pinMode(PIN_BUZZER, OUTPUT);
 
   Wire.begin();
-  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-    Serial.println(F("Display Error")); for(;;);
-  }
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) { for(;;); }
   
   if (!mpu.begin()) Serial.println("MPU Error");
-  else {
-    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  }
+  else { mpu.setAccelerometerRange(MPU6050_RANGE_8_G); mpu.setFilterBandwidth(MPU6050_BAND_21_HZ); }
 
   preferences.begin("user-config", false);
   String savedName = preferences.getString("name", "Friend");
   savedName.toCharArray(userName, 32);
 
   cyberpunkBoot();
-  runWiFiManager();
+  silentWiFiConnect(); 
+  
   lastMotionTime = millis();
+  lastTherapyTime = millis();
 }
 
 void cyberpunkBoot() {
   display.clearDisplay();
   display.setTextSize(2); display.setTextColor(WHITE);
   display.setCursor(5, 15); display.print("PicchiBot");
-  display.setTextSize(1); display.setCursor(115, 15); display.print("V11");
+  display.setTextSize(1); display.setCursor(115, 15); display.print("24");
   display.drawLine(0, 35, 128, 35, WHITE);
   display.setCursor(75, 45); display.print("by Lian");
   display.display();
@@ -156,87 +170,78 @@ void cyberpunkBoot() {
   tone(PIN_BUZZER, 4000, 400); delay(1500);
 }
 
-void runWiFiManager() {
-  display.clearDisplay();
-  display.setTextSize(1); display.setTextColor(WHITE);
-  
-  WiFiManager wm;
-  
-  // 1. FORCE OFFLINE OPTION
-  // Check if OK button held during boot
-  if(digitalRead(BTN_OK) == LOW) {
-    wifiConnected = false;
-    display.clearDisplay();
-    display.setCursor(0, 20); display.println("Force Offline");
-    display.display();
-    delay(1000);
-    return;
-  }
+void silentWiFiConnect() {
+  String savedSSID = preferences.getString("ssid", "");
+  String savedPass = preferences.getString("pass", "");
 
-  WiFiManagerParameter custom_name("name", "Enter Your Name", userName, 32);
-  wm.addParameter(&custom_name);
-
-  // 2. STANDARD MODE (Solid, reliable)
-  wm.setAPCallback([](WiFiManager *myWiFiManager) {
-    display.clearDisplay();
-    display.setCursor(0,0); display.println("SETUP MODE");
-    display.setCursor(0,15); display.println("WiFi: PicchiSetup");
-    display.setCursor(0,25); display.println("Pass: 12345678");
-    display.setCursor(0,40); display.print("IP: "); display.println(WiFi.softAPIP()); 
-    display.display();
-    tone(PIN_BUZZER, 1000, 500);
-  });
-
-  // This will BLOCK until connected. Reliable.
-  if(!wm.autoConnect("PicchiSetup", "12345678")) {
-    wifiConnected = false;
-    display.clearDisplay(); display.setCursor(0,20); display.println("Setup Failed"); display.display();
-  } else {
-    wifiConnected = true;
-    if (strlen(custom_name.getValue()) > 0) {
-      strcpy(userName, custom_name.getValue());
-      preferences.putString("name", userName);
-    }
-    configTime(21600, 0, "pool.ntp.org");
+  if(savedSSID.length() > 0) {
+    display.clearDisplay(); display.setCursor(0,20); display.print("Connecting..."); 
+    display.setCursor(0,35); display.print(savedSSID); display.display();
+    WiFi.begin(savedSSID.c_str(), savedPass.c_str());
+    int t = 0;
+    while(WiFi.status() != WL_CONNECTED && t < 20) { delay(250); t++; }
     
-    display.clearDisplay();
-    display.setCursor(0,20); display.println("Connected!");
-    display.setCursor(0,40); display.print("Hi "); display.println(userName);
-    display.display();
-    delay(1500);
+    if(WiFi.status() == WL_CONNECTED) {
+      wifiConnected = true; configTime(21600, 0, "pool.ntp.org");
+      display.clearDisplay(); display.setCursor(0,20); display.print("Online!"); display.display(); delay(1000);
+      checkRain();
+    } else {
+      wifiConnected = false;
+      display.clearDisplay(); display.setCursor(0,20); display.print("Offline"); display.display(); delay(1000);
+    }
+  } else {
+    wifiConnected = false;
   }
 }
 
 // --- SOUND FX ---
-void makeHappySound() { tone(PIN_BUZZER,2000,80); delay(100); tone(PIN_BUZZER,2500,80); delay(100); tone(PIN_BUZZER,3500,150); }
-void makeAngrySound() { tone(PIN_BUZZER,150,300); delay(350); tone(PIN_BUZZER,100,500); }
-void makeRobotSound() { for (int i=0; i<3; i++) { tone(PIN_BUZZER, random(1000, 3000), 100); delay(150); } }
 void sndClick() { tone(PIN_BUZZER, 4000, 20); }
 void sndBack()  { tone(PIN_BUZZER, 2000, 50); }
+void sndType()  { tone(PIN_BUZZER, 3000, 10); }
 void sndJump()  { tone(PIN_BUZZER, 600, 30); }
 void sndDie()   { tone(PIN_BUZZER, 150, 400); }
-void sndPoint() { tone(PIN_BUZZER, 2500, 100); }
-void sndAlarm() { for(int i=0; i<3; i++) { tone(PIN_BUZZER, 3000, 200); delay(250); tone(PIN_BUZZER, 2000, 200); delay(250); } }
+void sndPing()  { tone(PIN_BUZZER, 1500, 50); }
+void sndNotify(){ tone(PIN_BUZZER, 1000, 100); delay(100); tone(PIN_BUZZER, 2000, 200); }
+void makeHappy() { tone(PIN_BUZZER,2000,80); delay(100); tone(PIN_BUZZER,3500,150); }
+void makeAngry() { tone(PIN_BUZZER,150,300); delay(350); tone(PIN_BUZZER,100,500); }
+void sndAlarm()  { for(int i=0; i<3; i++) { tone(PIN_BUZZER, 3000, 200); delay(250); tone(PIN_BUZZER, 2000, 200); delay(250); } }
+void makeRobotSound() { for (int i=0; i<3; i++) { tone(PIN_BUZZER, random(1000, 3000), 100); delay(150); } }
 
 // --- MAIN LOOP ---
 void loop() {
   if (wifiConnected && currentState == FACE) {
-    if (millis() - lastQuakeCheck > 300000) { checkEarthquake(); lastQuakeCheck = millis(); }
-    if (millis() - lastRainCheck > 600000) { checkRain(); lastRainCheck = millis(); }
+    unsigned long now = millis();
+    if (now - lastQuakeCheck > 300000) { checkEarthquake(); lastQuakeCheck = now; }
+    if (now - lastRainCheck > 600000) { checkRain(); lastRainCheck = now; }
   }
 
-  if (digitalRead(BTN_OK) == LOW) {
-    unsigned long p = millis();
-    while(digitalRead(BTN_OK) == LOW); 
-    if (millis() - p > 800) { currentState = FACE; sndBack(); return; } 
-    else handleShortPress();
+  // Auto Therapy Trigger
+  if (currentState == FACE && (millis() - lastTherapyTime > THERAPY_INTERVAL)) {
+    aiResponse = "Checking in... How are you feeling right now?";
+    currentState = THERAPY; sndNotify(); lastTherapyTime = millis();
+  }
+
+  if (currentState != KEYBOARD && currentState != WIFI_SCAN && currentState != AI_THINKING && currentState != THERAPY) { 
+    if (digitalRead(BTN_OK) == LOW) {
+      unsigned long p = millis();
+      while(digitalRead(BTN_OK) == LOW); 
+      if (millis() - p > 800) { currentState = FACE; sndBack(); return; } 
+      else handleShortPress();
+    }
+  } else if (currentState == KEYBOARD) {
+    runKeyboard(); 
+  } else if (currentState == WIFI_SCAN) {
+    runWiFiScanner();
+  } else if (currentState == THERAPY) {
+    runTherapySession();
   }
 
   switch(currentState) {
     case FACE:        runFaceEngine(); break;
     case MENU:        runMenu(); break;
+    case THERAPY:     /* Handled above */ break;
+    case GAME_PONG:   runPongGame(); break;
     case GAME_DINO:   runDinoGame(); break;
-    case GAME_FLAPPY: runFlappyGame(); break;
     case GAME_BRICK:  runBrickGame(); break;
     case CLOCK:       runClock(); break;
     case WEATHER:     runWeather(); break;
@@ -244,7 +249,10 @@ void loop() {
     case TIMER:       runTimer(); break;
     case POMODORO:    runPomodoro(); break;
     case JOKE:        runJoke(); break;
-    case ALERT_MODE:   runAlert(); break;
+    case ALERT_MODE:  runAlert(); break;
+    case KEYBOARD:    break; 
+    case WIFI_SCAN:   break;
+    case AI_THINKING: break; 
   }
 }
 
@@ -254,19 +262,17 @@ void handleShortPress() {
   else if (currentState == MENU) {
     switch(menuIndex) {
       case 0: currentState = FACE; break;
-      case 1: currentState = TIMER; break;
-      case 2: currentState = POMODORO; break;
-      case 3: currentState = NEWS; newsPage=1; fetchNews(); break;
-      case 4: currentState = GAME_DINO; break;
-      case 5: currentState = GAME_FLAPPY; break;
-      case 6: currentState = GAME_BRICK; break;
-      case 7: currentState = CLOCK; break;
-      case 8: currentState = WEATHER; if(wifiConnected) checkRain(); break;
-      case 9: currentState = JOKE; if(wifiConnected) fetchJoke(); break;
-      case 10: 
-        display.clearDisplay(); display.setCursor(10,20); display.print("Resetting..."); display.display();
-        WiFiManager wm; wm.resetSettings(); ESP.restart(); 
-        break;
+      case 1: currentState = GAME_PONG; break;
+      case 2: currentState = GAME_BRICK; break;
+      case 3: currentState = GAME_DINO; break;
+      case 4: currentState = TIMER; break;
+      case 5: currentState = POMODORO; break;
+      case 6: currentState = THERAPY; aiScrollY=0; break; 
+      case 7: currentState = NEWS; newsPage=1; fetchNews(); break;
+      case 8: currentState = CLOCK; break;
+      case 9: currentState = WEATHER; if(wifiConnected) checkRain(); break;
+      case 10: currentState = JOKE; if(wifiConnected) fetchJoke(); break;
+      case 11: currentState = WIFI_SCAN; startWiFiScan(); break; 
     }
   } else if (currentState == ALERT_MODE) {
     currentState = FACE;
@@ -274,268 +280,384 @@ void handleShortPress() {
 }
 
 // ==================================================
-// 1. FACE ENGINE
+// 1. TIMER & POMODORO (SMART HOLD LOGIC)
 // ==================================================
-void drawWifiIcon() {
-  if(wifiConnected) {
-    // Draw small WiFi arcs top right
-    display.drawLine(118, 10, 120, 10, WHITE);
-    display.drawLine(116, 8, 122, 8, WHITE);
-    display.drawLine(114, 6, 124, 6, WHITE);
-  }
-}
-
-void runFaceEngine() {
-  sensors_event_t a, g, temp;
-  if(mpu.getEvent(&a, &g, &temp)) {
-    float mag = sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z));
-    if (mag > 13.0 || mag < 7.0) {
-      lastMotionTime = millis();
-      if (isSleeping) { isSleeping = false; isExcited = true; emotionTimer = millis(); makeHappySound(); currentEye = excited; }
-    }
-    if (isExcited && millis() - emotionTimer > 2000) { isExcited = false; currentEye = normal; }
-    if (mag > 20.0) { 
-      if (shakeStartTime == 0) shakeStartTime = millis();
-      if (millis() - shakeStartTime > 4000) {
-        if (!isAngry) { isAngry = true; emotionTimer = millis(); makeAngrySound(); currentEye = furious; }
-        shakeStartTime = millis();
-      } else if (millis() - shakeStartTime > 1000) { currentEye = disoriented; }
-    } else { shakeStartTime = 0; }
-    if (isAngry && millis() - emotionTimer > 3000) { isAngry = false; currentEye = normal; }
-    if (!isSleeping && !isAngry && !isExcited && (millis() - lastMotionTime > 30000)) { isSleeping = true; currentEye = sleepy; }
-    if (!isSleeping && !isAngry && !isExcited && !shakeStartTime) {
-      if (a.acceleration.y > 4.0) currentEye = look_down;
-      else if (a.acceleration.y < -4.0) currentEye = look_up;
-      else if (a.acceleration.x > 4.0) currentEye = look_left;
-      else if (a.acceleration.x < -4.0) currentEye = look_right;
-      else if (millis() - lastSaccade > random(3000, 8000)) {
-        int rand = random(0, 100);
-        if (rand < 50) currentEye = normal; else if (rand < 60) currentEye = focused; else if (rand < 70) currentEye = bored; else currentEye = blink; 
-        lastSaccade = millis();
-      }
-    }
-  }
-  if (currentEye != furious && currentEye != disoriented && currentEye != sleepy) {
-    if (millis() - lastBlink > random(2000, 6000)) {
-      display.clearDisplay();
-      if(currentEye == look_up) display.drawBitmap(0,0, blink_up, 128,64, WHITE);
-      else if(currentEye == look_down) display.drawBitmap(0,0, blink_down, 128,64, WHITE);
-      else display.drawBitmap(0,0, blink, 128,64, WHITE);
-      drawWifiIcon(); display.display(); delay(150); lastBlink = millis();
-    }
-  }
-  display.clearDisplay(); display.drawBitmap(0, 0, currentEye, 128, 64, WHITE); 
-  drawWifiIcon(); display.display();
-}
-
-// ==================================================
-// 2. TIMER: TICK TOCK EDITION
-// ==================================================
-int timerMin=0, timerSec=0; 
-bool timerActive=false; 
-unsigned long timerTarget=0;
-int timerSel = 0; // 0 = Min, 1 = Sec
-unsigned long lastBombBeep = 0;
-
+int timerMin=0, timerSec=0, timerSel=0; bool timerActive=false; unsigned long timerTarget=0; unsigned long lastBomb=0;
 void runTimer() {
   display.clearDisplay();
   
-  if (timerActive) {
-    // RUNNING MODE
-    long remaining = (long)(timerTarget - millis());
-    
-    if (remaining <= 0) {
-      timerActive = false;
-      // EXPLOSION SOUND
-      for(int i=0; i<5; i++) { tone(PIN_BUZZER, 100 + random(0,500), 50); delay(50); }
-      tone(PIN_BUZZER, 2000, 1000);
-    } else {
-      // BOMB SOUND LOGIC
-      long interval = remaining / 20; // Beep gets faster as time drops
-      if (interval < 50) interval = 50; // Cap max speed
-      if (interval > 1000) interval = 1000; // Cap slow speed
-      
-      if (millis() - lastBombBeep > interval) {
-        tone(PIN_BUZZER, 3000, 20); // Short Tick
-        lastBombBeep = millis();
-      }
+  // HOLD TO EXIT (3s)
+  if(digitalRead(BTN_OK)==LOW) {
+    unsigned long p=millis(); while(digitalRead(BTN_OK)==LOW);
+    if(millis()-p > 3000) { currentState=FACE; sndBack(); return; }
+    // HOLD TO START (2s)
+    else if (millis()-p > 1500 && !timerActive) {
+      if(timerMin>0||timerSec>0){ timerTarget=millis()+(timerMin*60000)+(timerSec*1000); timerActive=true; sndClick(); }
+    }
+  }
 
-      int m = (remaining / 1000) / 60;
-      int s = (remaining / 1000) % 60;
-      
-      display.setTextSize(1); display.setCursor(40, 0); display.print("RUNNING");
-      display.setTextSize(3); display.setCursor(20, 30);
-      if(m<10) display.print("0"); display.print(m); display.print(":");
-      if(s<10) display.print("0"); display.print(s);
+  if(timerActive){
+    long rem=(long)(timerTarget-millis());
+    if(rem<=0){timerActive=false;sndAlarm();}
+    else{
+      long inv=rem/20; if(inv<50)inv=50; if(inv>1000)inv=1000;
+      if(millis()-lastBomb>inv){tone(PIN_BUZZER,3000,20);lastBomb=millis();}
+      int m=(rem/1000)/60; int s=(rem/1000)%60;
+      display.setTextSize(3);display.setCursor(20,30);if(m<10)display.print("0");display.print(m);display.print(":");if(s<10)display.print("0");display.print(s);
+      display.setTextSize(1);display.setCursor(25,55);display.print("Hold OK to Stop");
     }
-  } 
-  else {
-    // SETUP MODE with Rounded Box
-    display.setTextSize(1); display.setCursor(35, 0); display.print("SET TIMER");
+  } else {
+    display.setTextSize(1);display.setCursor(35,0);display.print("SET TIMER");
     
-    // Selection Box Logic
-    if (timerSel == 0) display.drawRoundRect(15, 25, 40, 30, 4, WHITE); // Box around Mins
-    else display.drawRoundRect(70, 25, 40, 30, 4, WHITE); // Box around Secs
+    // Draw selection box
+    if(timerSel==0) display.drawRoundRect(15,25,42,28,4,WHITE); 
+    else display.drawRoundRect(70,25,42,28,4,WHITE);
     
-    // Navigation
-    if(digitalRead(BTN_LEFT)==LOW || digitalRead(BTN_RIGHT)==LOW) { 
-      timerSel = !timerSel; sndClick(); delay(200); 
-    }
-    if(digitalRead(BTN_UP)==LOW) {
-      if(timerSel==0) { timerMin++; if(timerMin>99) timerMin=0; }
-      else { timerSec+=5; if(timerSec>59) timerSec=0; }
-      sndClick(); delay(150);
-    }
-    if(digitalRead(BTN_DOWN)==LOW) {
-      if(timerSel==0) { timerMin--; if(timerMin<0) timerMin=99; }
-      else { timerSec-=5; if(timerSec<0) timerSec=55; }
-      sndClick(); delay(150);
-    }
+    if(digitalRead(BTN_LEFT)==LOW||digitalRead(BTN_RIGHT)==LOW){timerSel=!timerSel;sndClick();delay(200);}
+    if(digitalRead(BTN_UP)==LOW){if(timerSel==0){timerMin++;if(timerMin>99)timerMin=0;}else{timerSec+=5;if(timerSec>59)timerSec=0;}delay(100);}
+    if(digitalRead(BTN_DOWN)==LOW){if(timerSel==0){timerMin--;if(timerMin<0)timerMin=99;}else{timerSec-=5;if(timerSec<0)timerSec=55;}delay(100);}
     
-    // Draw Numbers
-    display.setTextSize(3); display.setCursor(20, 30);
-    if(timerMin<10) display.print("0"); display.print(timerMin); 
-    display.setCursor(55, 30); display.print(":");
-    display.setCursor(75, 30);
-    if(timerSec<10) display.print("0"); display.print(timerSec);
-    
-    display.setTextSize(1); display.setCursor(35, 55); display.print("OK to Start");
-    
-    if(digitalRead(BTN_OK)==LOW && (timerMin>0||timerSec>0)){
-      timerTarget = millis() + (timerMin*60000) + (timerSec*1000);
-      timerActive = true;
-      sndClick(); delay(500);
-    }
+    display.setTextSize(3);display.setCursor(20,30);if(timerMin<10)display.print("0");display.print(timerMin);display.setCursor(55,30);display.print(":");display.setCursor(75,30);if(timerSec<10)display.print("0");display.print(timerSec);
+    display.setTextSize(1);display.setCursor(10,55);display.print("Hold 2s:START 3s:EXIT");
   }
   display.display();
 }
 
-// ==================================================
-// 3. POMODORO (FIXED)
-// ==================================================
 int pomoState=0; unsigned long pomoEnd=0;
-void runPomodoro(){
+void runPomodoro(){ 
   display.clearDisplay();
   
-  if(pomoState==0){ // Setup
-    display.setTextSize(2);display.setCursor(15,10);display.print("POMODORO");
-    display.setTextSize(1);display.setCursor(10,40);display.print("OK: Start 20m Focus");
-    if(digitalRead(BTN_OK)==LOW){pomoState=1;pomoEnd=millis()+(20*60*1000);sndClick();delay(500);}
+  // HOLD LOGIC
+  if(digitalRead(BTN_OK)==LOW) {
+    unsigned long p=millis(); while(digitalRead(BTN_OK)==LOW);
+    if(millis()-p > 3000) { currentState=FACE; sndBack(); return; }
+    else if (millis()-p > 1500 && pomoState==0) {
+      pomoState=1; pomoEnd=millis()+(20*60*1000); sndClick();
+    }
   }
-  else {
+
+  if(pomoState==0){
+    display.setTextSize(2);display.setCursor(20,10);display.print("POMODORO");
+    display.setTextSize(1);display.setCursor(10,40);display.print("Hold 2s to Start");
+  } else {
     long rem=(long)(pomoEnd-millis())/1000;
+    if(rem<=0){sndAlarm();if(pomoState==1){pomoState=2;pomoEnd=millis()+(5*60*1000);}else{pomoState=0;}} 
+    display.setTextSize(2);display.setCursor(10,0);if(pomoState==1)display.print(" STUDY ");else display.print(" CHILL "); 
+    int m=rem/60;int s=rem%60;display.setTextSize(4);display.setCursor(5,30);if(m<10)display.print("0");display.print(m);display.print(":");if(s<10)display.print("0");display.print(s);
+  } 
+  display.display(); 
+}
+
+// ==================================================
+// 2. GAMES (PHYSICS 2.0)
+// ==================================================
+// PONG
+void runPongGame() {
+  ballX += ballDX; ballY += ballDY;
+  
+  // Easy Paddle Control
+  if(digitalRead(BTN_UP)==LOW) paddleY -= 3; 
+  if(digitalRead(BTN_DOWN)==LOW) paddleY += 3;
+  if(paddleY < 0) paddleY = 0; if(paddleY > 48) paddleY = 48;
+
+  // AI Tracking (Intentionally imperfect)
+  if(ballX > 64 && ballDX > 0) {
+    if(ballY > cpuY + 8) cpuY += 1.5; // Slower than ball
+    else if(ballY < cpuY + 8) cpuY -= 1.5;
+  }
+  if(cpuY < 0) cpuY = 0; if(cpuY > 48) cpuY = 48;
+
+  // Physics Bounds
+  if(ballY <= 0 || ballY >= 63) { ballDY = -ballDY; sndClick(); } // Wall Hit
+
+  // Collision - Player
+  if (ballX < 6 && ballX > 2 && ballY >= paddleY && ballY <= paddleY + 16) {
+    ballDX = abs(ballDX) * 1.05; // Speed up slightly
+    if (ballDX > 3) ballDX = 3;  // Cap speed
+    sndPing();
+  }
+
+  // Collision - CPU
+  if (ballX > 120 && ballX < 124 && ballY >= cpuY && ballY <= cpuY + 16) {
+    ballDX = -abs(ballDX);
+    sndPing();
+  }
+
+  // Scoring
+  if(ballX < 0) { cScore++; ballX=64; ballY=32; ballDX=2; ballDY=1.5; sndDie(); }
+  if(ballX > 128) { pScore++; ballX=64; ballY=32; ballDX=-2; ballDY=1.5; makeHappy(); }
+
+  display.clearDisplay();
+  for(int i=0;i<64;i+=4)display.drawPixel(64,i,WHITE);
+  display.setTextSize(1);display.setCursor(50,0);display.print(pScore);display.setCursor(74,0);display.print(cScore);
+  display.fillRect(2,paddleY,2,16,WHITE); // Player
+  display.fillRect(124,cpuY,2,16,WHITE);   // CPU
+  display.fillCircle((int)ballX,(int)ballY,2,WHITE);
+  display.display();
+}
+
+// BRICK BREAKER (DX BALL)
+float ballX2=64,ballY2=50,ballDX2=1.5,ballDY2=-1.5; int padX2=50,brickScore2=0; 
+bool bricks[4][10],brickInit=false,brickOver=false;
+void resetBricks(){for(int r=0;r<4;r++)for(int c=0;c<10;c++)bricks[r][c]=true;brickInit=true;ballX2=64;ballY2=50;ballDY2=-1.5;ballDX2=1.5;brickScore2=0;pUp.active=false;}
+
+void runBrickGame(){ 
+  if(!brickInit) resetBricks();
+  
+  if(brickOver){
+    display.clearDisplay();display.setCursor(20,20);display.print("GAME OVER");display.display();
+    if(digitalRead(BTN_OK)==LOW){brickOver=false;resetBricks();delay(500);}return;
+  }
+  
+  // Paddle (Wider default)
+  if(digitalRead(BTN_LEFT)==LOW) padX2-=4; 
+  if(digitalRead(BTN_RIGHT)==LOW) padX2+=4;
+  if(padX2<0) padX2=0; if(padX2>128-paddleWidth) padX2=128-paddleWidth;
+
+  // Ball Physics
+  float nextX = ballX2 + ballDX2;
+  float nextY = ballY2 + ballDY2;
+  
+  // Wall Bounce
+  if(nextX<=0 || nextX>=128) ballDX2 = -ballDX2;
+  if(nextY<=0) ballDY2 = -ballDY2;
+  if(nextY>64) { sndDie(); brickOver=true; }
+
+  // Paddle Bounce (Predictive)
+  if(nextY >= 58 && nextY <= 62 && nextX >= padX2 && nextX <= padX2+paddleWidth) {
+    ballDY2 = -abs(ballDY2); // Always go up
+    sndJump();
+  }
+
+  // Brick Logic
+  int c = (nextX-4)/12; int r = (nextY-4)/6;
+  if(r>=0 && r<4 && c>=0 && c<10 && bricks[r][c]) {
+    bricks[r][c] = false;
+    ballDY2 = -ballDY2;
+    brickScore2 += 10;
+    sndClick();
     
-    // State Transition
-    if(rem<=0){
-      sndAlarm();
-      if(pomoState==1){ // Study done -> Break
-        pomoState=2; pomoEnd=millis()+(5*60*1000); 
-      } else { // Break done -> Reset
-        pomoState=0;
+    // Random Powerup Drop (10% chance)
+    if(random(0,10) == 0 && !pUp.active) {
+      pUp.active = true; pUp.x = nextX; pUp.y = nextY; pUp.type = random(0,2);
+    }
+  }
+  
+  // Powerup Physics
+  if(pUp.active) {
+    pUp.y += 1.5;
+    if(pUp.y > 64) pUp.active = false;
+    // Catch Powerup
+    if(pUp.y >= 58 && pUp.x >= padX2 && pUp.x <= padX2+paddleWidth) {
+      if(pUp.type == 0) paddleWidth = 30; // Expand
+      else paddleWidth = 14; // Shrink
+      sndPing();
+      pUp.active = false;
+    }
+  }
+  
+  ballX2 += ballDX2; ballY2 += ballDY2;
+  
+  // Level Complete Check
+  bool allClear = true;
+  for(int r=0;r<4;r++) for(int c=0;c<10;c++) if(bricks[r][c]) allClear = false;
+  if(allClear) resetBricks(); // Infinite Levels
+
+  display.clearDisplay();
+  display.fillRect(padX2,60,paddleWidth,3,WHITE);
+  display.fillCircle((int)ballX2,(int)ballY2,2,WHITE);
+  
+  if(pUp.active) {
+    display.setCursor((int)pUp.x, (int)pUp.y);
+    if(pUp.type==0) display.print("+"); else display.print("-");
+  }
+  
+  for(int r=0;r<4;r++) for(int c=0;c<10;c++) if(bricks[r][c]) display.fillRect(4+(c*12)+1,4+(r*6)+1,10,4,WHITE);
+  display.display(); 
+}
+
+// ==================================================
+// 3. NETWORK APPS (ROBUST SSL)
+// ==================================================
+void fetchNews() {
+  if (!wifiConnected) { newsTitle = "Offline"; return; }
+  display.clearDisplay(); display.setCursor(10,20); display.print("Loading News..."); display.display();
+  
+  WiFiClientSecure client; 
+  client.setInsecure(); // IGNORE CERTIFICATE ERRORS (CRITICAL FIX)
+  client.setTimeout(10000); // 10s timeout
+  
+  HTTPClient http; 
+  String url = "https://newsapi.org/v2/top-headlines?country=us&category=technology&pageSize=1&page=" + String(newsPage) + "&apiKey=" + String(NEWS_API_KEY);
+  
+  http.begin(client, url);
+  http.addHeader("User-Agent", "Mozilla/5.0"); // FAKE BROWSER HEADER
+  
+  int code = http.GET();
+  if (code == 200) { 
+    String p = http.getString(); 
+    JsonDocument d; deserializeJson(d, p); 
+    if (d["totalResults"].as<int>() > 0) { 
+      newsTitle = d["articles"][0]["title"].as<String>(); 
+      newsSource = d["articles"][0]["source"]["name"].as<String>(); 
+    } else { newsTitle = "No News Found"; } 
+  } else { 
+    newsTitle = "HTTP Error: " + String(code); 
+  } 
+  http.end(); newsScrollX = 128;
+}
+
+void checkRain() {
+  if (!wifiConnected) return; 
+  WiFiClientSecure c; c.setInsecure(); HTTPClient h; 
+  h.begin(c, "https://api.openweathermap.org/data/2.5/weather?q=Dhaka,bd&units=metric&appid=" + String(OW_APIKEY));
+  if(h.GET()==200) { 
+    String p=h.getString(); JsonDocument d; deserializeJson(d,p);
+    tempStr=String(d["main"]["temp"].as<float>(),1); 
+    String w=d["weather"][0]["main"].as<String>(); weatherDesc=w;
+    if(w.indexOf("Rain")!=-1 || w.indexOf("Thunder")!=-1){alertType="BAD WEATHER";alertInfo=w;currentState=ALERT_MODE;}
+  } h.end();
+}
+
+// ==================================================
+// 4. STANDARD FUNCTIONS (Keyboard, WiFi Scan, etc)
+// ==================================================
+// (These functions remain identical to previous working versions)
+void runWiFiScanner() {
+  display.clearDisplay();
+  display.setTextSize(1); display.setCursor(0,0); display.print("NETWORKS:"); display.drawLine(0,9,128,9,WHITE);
+  if (wifiCount == 0) {
+    display.setCursor(10,20); display.print("No Networks");
+    if(digitalRead(BTN_OK)==LOW) { currentState = MENU; delay(200); }
+  } else {
+    for(int i=0; i<4; i++) {
+      int idx = wifiScroll + i;
+      if(idx < wifiCount) {
+        display.setCursor(10, 15 + (i*12)); if(i==0) display.print(">"); 
+        display.setCursor(20, 15 + (i*12)); String ssid = WiFi.SSID(idx);
+        if(ssid.length()>14) ssid = ssid.substring(0,14); display.print(ssid);
       }
     }
-    
-    display.setTextSize(2);display.setCursor(10,0);
-    if(pomoState==1) display.print(" STUDY "); else display.print(" CHILL ");
-    
-    int m=rem/60;int s=rem%60;
-    display.setTextSize(4);display.setCursor(5,30);
-    if(m<10)display.print("0");display.print(m);display.print(":");
-    if(s<10)display.print("0");display.print(s);
+    if(digitalRead(BTN_DOWN)==LOW) { wifiScroll++; if(wifiScroll >= wifiCount) wifiScroll=0; sndClick(); delay(150); }
+    if(digitalRead(BTN_UP)==LOW) { wifiScroll--; if(wifiScroll < 0) wifiScroll=wifiCount-1; sndClick(); delay(150); }
+    if(digitalRead(BTN_OK)==LOW) {
+      targetSSID = WiFi.SSID(wifiScroll); keyboardBuffer = ""; keyboardTarget = 1; 
+      kbPage = 0; currentState = KEYBOARD; sndClick(); delay(500);
+    }
   }
   display.display();
 }
 
-// ==================================================
-// 4. OTHER APPS (News, Menu, etc)
-// ==================================================
-void runNewsApp() {
-  display.clearDisplay(); display.drawBitmap(0, 0, worried, 128, 64, WHITE);
-  display.fillRect(0, 40, 128, 24, BLACK); display.drawLine(0, 40, 128, 40, WHITE);
-  display.setTextSize(1); display.setCursor(0, 42); display.print("NEWS("); display.print(newsPage); display.print("): "); display.print(newsSource);
-  display.setCursor(newsScrollX, 52); display.print(newsTitle);
-  newsScrollX -= 2; if (newsScrollX < - (int)(newsTitle.length() * 6)) newsScrollX = 128;
-  display.display();
-  if(digitalRead(BTN_RIGHT)==LOW) { newsPage++; fetchNews(); delay(200); }
-  if(digitalRead(BTN_LEFT)==LOW && newsPage>1) { newsPage--; fetchNews(); delay(200); }
+void startWiFiScan() {
+  display.clearDisplay(); display.setCursor(10,20); display.print("Scanning..."); display.display();
+  WiFi.mode(WIFI_STA); WiFi.disconnect();
+  wifiCount = WiFi.scanNetworks(); wifiScroll = 0;
 }
-void fetchNews() {
-  if (!wifiConnected) { newsTitle = "No WiFi Connection"; newsSource="Error"; return; }
-  display.clearDisplay(); display.drawBitmap(0, 0, alert, 128, 64, WHITE); 
-  display.setCursor(30, 50); display.setTextSize(1); display.print("FETCHING..."); display.display();
-  HTTPClient http; WiFiClientSecure client; client.setInsecure();
-  String url = "https://newsapi.org/v2/top-headlines?country=bd&pageSize=1&page=" + String(newsPage) + "&apiKey=" + String(NEWS_API_KEY);
-  http.begin(client, url); http.addHeader("User-Agent", "PicchiBot/1.0");
-  if (http.GET() > 0) {
-    String p = http.getString(); JsonDocument doc; deserializeJson(doc, p);
-    if (doc["totalResults"].as<int>() > 0 && doc["articles"][0]["title"]) {
-      newsTitle = doc["articles"][0]["title"].as<String>();
-      newsSource = doc["articles"][0]["source"]["name"].as<String>();
-    } else { newsTitle = "End of Headlines"; newsSource = "System"; }
-  } else { newsTitle = "API Error"; display.clearDisplay(); display.drawBitmap(0, 0, despair, 128, 64, WHITE); display.display(); delay(1000); }
-  http.end(); newsScrollX = 128;
+
+void runKeyboard() {
+  display.clearDisplay();
+  display.setTextSize(1); display.setCursor(0,0); 
+  if(keyboardTarget == 1) display.print("PASS: "); else display.print("SAY: ");
+  display.setCursor(100,0); if(kbPage==0) display.print("ABC"); else if(kbPage==1) display.print("abc"); else display.print("123");
+
+  display.drawRect(0, 10, 128, 15, WHITE);
+  display.setCursor(2, 14); 
+  if(keyboardBuffer.length() > 18) display.print(keyboardBuffer.substring(keyboardBuffer.length()-18));
+  else display.print(keyboardBuffer);
+  if ((millis()/500)%2==0) display.print("_");
+
+  if (digitalRead(BTN_UP)==LOW) { kbRow--; if(kbRow<0) kbRow=2; delay(150); }
+  if (digitalRead(BTN_DOWN)==LOW) { kbRow++; if(kbRow>2) kbRow=0; delay(150); }
+  if (digitalRead(BTN_LEFT)==LOW) { kbCol--; if(kbCol<0) kbCol=9; delay(150); }
+  if (digitalRead(BTN_RIGHT)==LOW) { kbCol++; if(kbCol>9) kbCol=0; delay(150); }
+
+  int startY = 30;
+  for(int r=0; r<3; r++) {
+    for(int c=0; c<10; c++) {
+      int x = 4 + (c * 12); int y = startY + (r * 10);
+      if(r == kbRow && c == kbCol) { display.fillRect(x-1, y-1, 10, 9, WHITE); display.setTextColor(BLACK); } 
+      else { display.setTextColor(WHITE); }
+      display.setCursor(x+2, y); display.print(keys[kbPage][r][c]);
+    }
+  }
+  display.setTextColor(WHITE);
+
+  if (digitalRead(BTN_OK) == LOW) {
+    unsigned long p = millis(); while(digitalRead(BTN_OK) == LOW); 
+    if (millis() - p > 600) {
+      if(keyboardTarget == 1) { 
+        display.clearDisplay(); display.setCursor(10,20); display.print("Connecting..."); display.display();
+        WiFi.begin(targetSSID.c_str(), keyboardBuffer.c_str());
+        int t=0; while(WiFi.status()!=WL_CONNECTED && t<20){ delay(500); t++; }
+        if(WiFi.status()==WL_CONNECTED) {
+          wifiConnected=true; preferences.putString("ssid", targetSSID); preferences.putString("pass", keyboardBuffer);
+          configTime(21600, 0, "pool.ntp.org"); display.setCursor(10,40); display.print("Success!");
+        } else { display.setCursor(10,40); display.print("Failed."); }
+        display.display(); delay(1500); currentState = FACE;
+      } else { 
+        callGeminiAPI();
+      }
+    } else {
+      sndType();
+      String k = String(keys[kbPage][kbRow][kbCol]);
+      if (k == "^") { kbPage++; if(kbPage > 2) kbPage = 0; } 
+      else if (k == "<") { if (keyboardBuffer.length() > 0) keyboardBuffer.remove(keyboardBuffer.length()-1); } 
+      else if (k == "_") { keyboardBuffer += " "; } 
+      else { if (keyboardBuffer.length() < 50) keyboardBuffer += k; }
+    }
+  }
+  display.display(); 
 }
-void runAlert() {
-  static bool inverted = false; inverted = !inverted; display.invertDisplay(inverted);
-  display.clearDisplay(); display.drawBitmap(0, 0, scared, 128, 64, WHITE); 
-  display.fillRect(0, 15, 128, 34, BLACK); display.drawRect(0, 15, 128, 34, WHITE);
-  display.setCursor(10, 20); display.setTextSize(2); display.print("WARNING!");
-  display.setCursor(10, 40); display.setTextSize(1); display.print(alertType);
-  display.display(); sndAlarm(); 
+
+void runTherapySession() {
+  display.clearDisplay();
+  display.drawBitmap(0, 0, focused, 128, 64, WHITE); 
+  display.fillRect(5, 35, 118, 28, BLACK); display.drawRect(5, 35, 118, 28, WHITE);
+  display.setCursor(8, 38); display.setTextSize(1);
+  if(aiResponse.length() > 18) { display.print(aiResponse.substring(0, 18)); display.setCursor(8, 48); display.print(aiResponse.substring(18, 36)); } else { display.print(aiResponse); }
+  display.setCursor(30, 5); display.print("Hold OK to Reply"); display.display();
+  
+  if (digitalRead(BTN_DOWN) == LOW) { aiScrollY += 8; delay(50); } 
+  if (digitalRead(BTN_UP) == LOW) { aiScrollY -= 8; if(aiScrollY < 0) aiScrollY = 0; delay(50); } 
+
+  if (digitalRead(BTN_OK) == LOW) {
+     unsigned long p=millis(); while(digitalRead(BTN_OK)==LOW);
+     if(millis()-p > 1000) { // Hold to reply
+        keyboardBuffer = ""; keyboardTarget = 0; kbPage = 0;
+        currentState = KEYBOARD; returnState = THERAPY;
+        sndClick();
+     }
+  }
 }
-void checkEarthquake() {
+
+void callGeminiAPI() {
+  if (!wifiConnected) { aiResponse = "No Internet"; currentState = THERAPY; return; }
+  currentState = AI_THINKING; display.clearDisplay(); display.setCursor(30, 30); display.print("Thinking..."); display.display();
   WiFiClientSecure client; client.setInsecure(); HTTPClient http;
-  http.begin(client, "https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&latitude=23.81&longitude=90.41&maxradiuskm=500&minmagnitude=2.0&limit=1");
-  if(http.GET()>0) { String p = http.getString(); JsonDocument doc; deserializeJson(doc, p);
-    if (doc["metadata"]["count"].as<int>() > 0) { float mag = doc["features"][0]["properties"]["mag"]; alertType = "EARTHQUAKE " + String(mag, 1); alertInfo = "Recent Detected!"; currentState = ALERT_MODE; }
-  } http.end();
+  String url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + String(GEMINI_API_KEY);
+  String prompt = "User: " + keyboardBuffer + ". Reply in 10 words.";
+  String json = "{\"contents\":[{\"parts\":[{\"text\":\"" + prompt + "\"}]}]}";
+  http.begin(client, url); http.addHeader("Content-Type", "application/json");
+  int httpCode = http.POST(json);
+  if(httpCode == 200) {
+    String p = http.getString(); DynamicJsonDocument doc(4096); deserializeJson(doc, p);
+    if (doc["candidates"][0]["content"]["parts"][0]["text"]) {
+      aiResponse = doc["candidates"][0]["content"]["parts"][0]["text"].as<String>();
+      aiResponse.replace("*", ""); 
+    } else { aiResponse = "Thinking..."; }
+  } else { aiResponse = "Error: " + String(httpCode); }
+  http.end(); aiScrollY = 0; currentState = THERAPY;
 }
-void checkRain() {
-  HTTPClient http; http.begin("https://api.openweathermap.org/data/2.5/weather?q=Dhaka,bd&units=metric&appid=" + String(OW_APIKEY));
-  if(http.GET()>0) { String p=http.getString(); JsonDocument doc; deserializeJson(doc,p);
-    tempStr=String(doc["main"]["temp"].as<float>(),1); String w=doc["weather"][0]["main"].as<String>(); weatherDesc=w;
-    if(w.indexOf("Rain")!=-1 || w.indexOf("Thunder")!=-1){alertType="BAD WEATHER";alertInfo=w;currentState=ALERT_MODE;}
-  } http.end();
-}
-void runMenu() {
-  display.invertDisplay(false); display.clearDisplay(); display.setTextSize(1); display.setTextColor(WHITE);
-  display.setCursor(0,0); display.print("USER: "); display.println(userName); display.drawLine(0,9,128,9,WHITE);
-  if(digitalRead(BTN_UP)==LOW) { menuIndex--; sndClick(); delay(150); }
-  if(digitalRead(BTN_DOWN)==LOW) { menuIndex++; sndClick(); delay(150); }
-  if(menuIndex < 0) menuIndex = menuLen-1; if(menuIndex >= menuLen) menuIndex = 0;
-  int startY = 15;
-  for (int i=0; i<4; i++) { int idx = (menuIndex + i) % menuLen;
-    display.setCursor(10, startY + (i*12)); if(i==0) display.print("> "); else display.print("  "); display.print(menuItems[idx]);
-  } display.display();
-}
-// Games
-int dinoY=45, dinoV=0, cactusX=128, dinoScore=0; bool dinoJump=false, dinoDead=false;
-void runDinoGame() {
-  static unsigned long lf=0; if(millis()-lf<30)return; lf=millis();
-  if(dinoDead){display.clearDisplay();display.setCursor(35,20);display.setTextSize(2);display.print("DIED");display.setCursor(40,40);display.setTextSize(1);display.print("Score: ");display.print(dinoScore);display.display();if(digitalRead(BTN_OK)==LOW||digitalRead(BTN_UP)==LOW){dinoDead=false;dinoScore=0;cactusX=128;delay(500);}return;}
-  if(digitalRead(BTN_UP)==LOW&&!dinoJump){dinoV=-9;dinoJump=true;sndJump();} dinoY+=dinoV; if(dinoY<45)dinoV+=2;else{dinoY=45;dinoV=0;dinoJump=false;}
-  cactusX-=6; if(cactusX<-10){cactusX=128+random(0,60);dinoScore++;sndClick();} if(cactusX<20&&cactusX>5&&dinoY>35){sndDie();dinoDead=true;}
-  display.clearDisplay();display.setTextSize(1);display.setCursor(0,0);display.print(dinoScore);display.drawLine(0,56,128,56,WHITE);display.fillRect(10,dinoY,10,10,WHITE);display.fillRect(cactusX,45,6,10,WHITE);display.display();
-}
-float birdY=32, birdV=0; int pipeX=128, gapY=20, flappyScore=0; bool flappyDead=false;
-void runFlappyGame() {
-  static unsigned long lf=0; if(millis()-lf<30)return; lf=millis();
-  if(flappyDead){display.clearDisplay();display.setCursor(30,20);display.setTextSize(2);display.print("CRASH");display.setCursor(40,40);display.setTextSize(1);display.print("Score: ");display.print(flappyScore);display.display();if(digitalRead(BTN_OK)==LOW||digitalRead(BTN_UP)==LOW){flappyDead=false;flappyScore=0;birdY=32;pipeX=128;delay(500);}return;}
-  if(digitalRead(BTN_UP)==LOW){birdV=-4.0;sndJump();} birdV+=0.6; birdY+=birdV; pipeX-=3; if(pipeX<-10){pipeX=128;gapY=random(5,35);flappyScore++;sndClick();}
-  if(birdY<0||birdY>60||(pipeX<24&&pipeX>16&&(birdY<gapY||birdY>gapY+25))){sndDie();flappyDead=true;}
-  display.clearDisplay();display.setTextSize(1);display.setCursor(0,0);display.print(flappyScore);display.fillCircle(20,(int)birdY,3,WHITE);display.fillRect(pipeX,0,8,gapY,WHITE);display.fillRect(pipeX,gapY+25,8,64-(gapY+25),WHITE);display.display();
-}
-float ballX=64,ballY=50,ballDX=2,ballDY=-2; int padX=50,brickScore=0; bool bricks[4][10],brickInit=false,brickOver=false;
-void resetBricks(){for(int r=0;r<4;r++)for(int c=0;c<10;c++)bricks[r][c]=true;brickInit=true;ballX=64;ballY=50;ballDY=-2;brickScore=0;}
-void runBrickGame(){
-  static unsigned long lf=0; if(millis()-lf<20)return; lf=millis(); if(!brickInit)resetBricks();
-  if(brickOver){display.clearDisplay();display.setCursor(20,20);display.setTextSize(2);display.print("GAME OVER");display.setCursor(40,40);display.setTextSize(1);display.print("Score: ");display.print(brickScore);display.display();if(digitalRead(BTN_OK)==LOW){brickOver=false;resetBricks();delay(500);}return;}
-  if(digitalRead(BTN_LEFT)==LOW)padX-=6;if(digitalRead(BTN_RIGHT)==LOW)padX+=6;if(padX<0)padX=0;if(padX>108)padX=108;
-  ballX+=ballDX;ballY+=ballDY; if(ballX<=0||ballX>=128){ballDX=-ballDX;sndClick();}if(ballY<=0){ballDY=-ballDY;sndClick();}if(ballY>64){sndDie();brickOver=true;}
-  if(ballY>=58&&ballY<=60&&ballX>=padX&&ballX<=padX+20){ballDY=-ballDY;sndJump();}
-  int col=(ballX-4)/12;int row=(ballY-4)/6;if(row>=0&&row<4&&col>=0&&col<10&&bricks[row][col]){bricks[row][col]=false;ballDY=-ballDY;brickScore+=10;sndPoint();}
-  display.clearDisplay();display.fillRect(padX,60,20,3,WHITE);display.fillCircle((int)ballX,(int)ballY,2,WHITE);for(int r=0;r<4;r++)for(int c=0;c<10;c++)if(bricks[r][c])display.fillRect(4+(c*12)+1,4+(r*6)+1,10,4,WHITE);display.display();
-}
+
+// --- OTHER ---
+void runMenu() { display.invertDisplay(false); display.clearDisplay(); display.setTextSize(1); display.setTextColor(WHITE); display.setCursor(0,0); display.print("User: "); display.println(userName); display.drawLine(0,9,128,9,WHITE); if(digitalRead(BTN_UP)==LOW) { menuIndex--; sndClick(); delay(150); } if(digitalRead(BTN_DOWN)==LOW) { menuIndex++; sndClick(); delay(150); } if(menuIndex < 0) menuIndex = menuLen-1; if(menuIndex >= menuLen) menuIndex = 0; int startY = 15; for (int i=0; i<4; i++) { int idx = (menuIndex + i) % menuLen; display.setCursor(10, startY + (i*12)); if(i==0) display.print(">"); else display.print(" "); display.print(menuItems[idx]); } display.display(); }
+void runFaceEngine() { sensors_event_t a, g, temp; if(mpu.getEvent(&a, &g, &temp)) { float mag = sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z)); if (mag > 13.0 || mag < 7.0) { lastMotionTime = millis(); if (isSleeping) { isSleeping=false; isExcited=true; emotionTimer=millis(); makeHappy(); currentEye=excited; } } if (isExcited && millis()-emotionTimer > 2000) { isExcited=false; currentEye=normal; } if (mag > 20.0) { if (shakeStartTime == 0) shakeStartTime = millis(); if (millis() - shakeStartTime > 4000) { if (!isAngry) { isAngry=true; emotionTimer=millis(); makeAngry(); currentEye=furious; } shakeStartTime = millis(); } else if (millis()-shakeStartTime > 1000) currentEye=disoriented; } else { shakeStartTime = 0; } if (isAngry && millis()-emotionTimer > 3000) { isAngry=false; currentEye=normal; } if (!isSleeping && !isAngry && !isExcited && (millis()-lastMotionTime > 30000)) { isSleeping=true; currentEye=sleepy; } if (!isSleeping && !isAngry && !isExcited && !shakeStartTime) { if (a.acceleration.y > 4.0) currentEye = look_down; else if (a.acceleration.y < -4.0) currentEye = look_up; else if (a.acceleration.x > 4.0) currentEye = look_left; else if (a.acceleration.x < -4.0) currentEye = look_right; else if (millis() - lastSaccade > random(3000, 8000)) { int rand = random(0, 100); if (rand < 50) currentEye = normal; else if (rand < 60) currentEye = focused; else if (rand < 70) currentEye = bored; else currentEye = blink; lastSaccade = millis(); } } } if (currentEye != furious && currentEye != disoriented && currentEye != sleepy) { if (millis() - lastBlink > random(2000, 6000)) { display.clearDisplay(); if(currentEye == look_up) display.drawBitmap(0,0, blink_up, 128,64, WHITE); else if(currentEye == look_down) display.drawBitmap(0,0, blink_down, 128,64, WHITE); else display.drawBitmap(0,0, blink, 128,64, WHITE); if(wifiConnected){display.drawLine(120, 8, 122, 8, WHITE); display.drawLine(118, 6, 124, 6, WHITE); display.drawLine(116, 4, 126, 4, WHITE);} display.display(); delay(150); lastBlink = millis(); } } display.clearDisplay(); display.drawBitmap(0, 0, currentEye, 128, 64, WHITE); if(wifiConnected){display.drawLine(120, 8, 122, 8, WHITE); display.drawLine(118, 6, 124, 6, WHITE); display.drawLine(116, 4, 126, 4, WHITE);} display.display(); }
+void runNewsApp() { display.clearDisplay(); display.drawBitmap(0, 0, worried, 128, 64, WHITE); display.fillRect(0, 40, 128, 24, BLACK); display.drawLine(0, 40, 128, 40, WHITE); display.setTextSize(1); display.setCursor(0, 42); display.print("NEWS: "); display.print(newsSource); display.setCursor(newsScrollX, 52); display.print(newsTitle); newsScrollX -= 2; if (newsScrollX < - (int)(newsTitle.length() * 6)) newsScrollX = 128; display.display(); if(digitalRead(BTN_RIGHT)==LOW) { newsPage++; fetchNews(); delay(200); } if(digitalRead(BTN_LEFT)==LOW && newsPage>1) { newsPage--; fetchNews(); delay(200); } }
+void checkEarthquake() { WiFiClientSecure c; c.setInsecure(); HTTPClient h; h.begin(c, "https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&latitude=23.81&longitude=90.41&maxradiuskm=500&minmagnitude=2.0&limit=1"); if(h.GET()>0) { String p=h.getString(); JsonDocument d; deserializeJson(d,p); if (d["metadata"]["count"].as<int>() > 0) { float mag = d["features"][0]["properties"]["mag"]; alertType = "QUAKE " + String(mag, 1); currentState = ALERT_MODE; } } h.end(); }
+void fetchJoke(){ if (!wifiConnected) { randomMsg = "No WiFi"; return; } display.clearDisplay(); display.setCursor(10,20); display.print("Loading..."); display.display(); WiFiClientSecure c; c.setInsecure(); HTTPClient h; h.begin(c, "https://v2.jokeapi.dev/joke/Programming?type=single&blacklistFlags=nsfw,religious,political,racist,sexist"); if(h.GET()>0){String p=h.getString(); JsonDocument d; deserializeJson(d,p); randomMsg=d["joke"].as<String>();} else { randomMsg = "Error"; } h.end(); }
 void runClock(){ struct tm t; if(getLocalTime(&t)){char b[10],d[20];strftime(b,10,"%H:%M:%S",&t);strftime(d,20,"%d %b",&t);display.clearDisplay();display.setTextSize(2);display.setCursor(15,20);display.print(b);display.setTextSize(1);display.setCursor(30,45);display.print(d);display.display();} }
+void runWeather(){ display.clearDisplay(); display.setTextSize(1); display.setCursor(0,0); display.print("DHAKA"); display.drawLine(0,9,128,9,WHITE); if(!wifiConnected){display.setCursor(0,20);display.print("Offline");}else{display.setTextSize(3);display.setCursor(10,20);display.print(tempStr);display.setTextSize(1);display.print("C");display.setCursor(0,55);display.print(weatherDesc);} display.display(); }
 void runJoke(){ display.clearDisplay(); display.setCursor(0,0); display.print("Joke:"); display.drawLine(0,9,128,9,WHITE); display.setCursor(0,15); if(!wifiConnected)display.print("Connect WiFi");else display.print(randomMsg); display.display();}
-void fetchJoke(){ WiFiClientSecure c; c.setInsecure(); HTTPClient h; h.begin(c,"https://v2.jokeapi.dev/joke/Programming?type=single&blacklistFlags=nsfw,religious,political,racist,sexist"); if(h.GET()>0){String p=h.getString(); JsonDocument d; deserializeJson(d,p); randomMsg=d["joke"].as<String>();} h.end();}
+void runAlert() { static bool inv = false; inv=!inv; display.invertDisplay(inv); display.clearDisplay(); display.drawBitmap(0, 0, scared, 128, 64, WHITE); display.fillRect(0, 15, 128, 34, BLACK); display.drawRect(0, 15, 128, 34, WHITE); display.setCursor(10, 20); display.setTextSize(2); display.print("WARNING!"); display.setCursor(10, 40); display.setTextSize(1); display.print(alertType); display.display(); sndAlarm(); }
+int dinoY=45,dinoV=0,cactusX=128,dinoScore=0; bool dinoJump=false,dinoDead=false;
+void runDinoGame() { static unsigned long lf=0;if(millis()-lf<30)return;lf=millis(); if(dinoDead){display.clearDisplay();display.setCursor(35,20);display.print("DIED");display.display();if(digitalRead(BTN_UP)==LOW){dinoDead=false;dinoScore=0;cactusX=128;delay(500);}return;} if(digitalRead(BTN_UP)==LOW&&!dinoJump){dinoV=-9;dinoJump=true;sndJump();} dinoY+=dinoV;if(dinoY<45)dinoV+=2;else{dinoY=45;dinoV=0;dinoJump=false;} cactusX-=6;if(cactusX<-10){cactusX=128+random(0,60);dinoScore++;sndClick();} if(cactusX<20&&cactusX>5&&dinoY>35){sndDie();dinoDead=true;} display.clearDisplay();display.setCursor(0,0);display.print(dinoScore);display.drawLine(0,56,128,56,WHITE);display.fillRect(10,dinoY,10,10,WHITE);display.fillRect(cactusX,45,6,10,WHITE);display.display(); }
