@@ -63,9 +63,9 @@
 #define BTN_RIGHT  27
 #define BTN_OK     32
 
-const char* OW_APIKEY = "9c5ed9a6da0fc29aac5db777c9638d1a"; 
-const char* NEWS_API_KEY = "5df4945cab76462896d02c54d23ca77d"; 
-const char* GEMINI_API_KEY = "AIzaSyB_NfMMWJyxwrgkkG7cKUd74_MxUyMOePA"; 
+const char* OW_APIKEY = "9c5ed****************638d1a"; 
+const char* NEWS_API_KEY = "5df4945****************ca77d"; 
+const char* GEMINI_API_KEY = "AIzaSyB_*****************_MxUyMOePA"; 
 
 // --- 3. GLOBALS ---
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
